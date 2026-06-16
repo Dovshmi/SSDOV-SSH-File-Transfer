@@ -1,0 +1,16 @@
+[Unit]
+Description=SSDOV SSH Downloader
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOURUSER/ssh-downloader
+Environment=SSHDOWN_PASSWORD=change-this-password
+# Or use public-key auth instead:
+# Environment=SSHDOWN_AUTHORIZED_KEYS=/home/YOURUSER/.ssh/authorized_keys
+ExecStart=/home/YOURUSER/ssh-downloader/ssdov -addr :2222 -root /srv/downloads -user download
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
