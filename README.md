@@ -13,6 +13,7 @@ Default SSDOV port: `2222`
 - File/folder navigation over SSH
 - File preview in the TUI
 - Download command hints for selected files
+- Optional upload command and TUI upload helper
 - Direct non-interactive download commands for scripts
 - Password auth or public-key auth
 - Path traversal protection: users stay inside the configured download root
@@ -27,8 +28,8 @@ root /
 › 📁  docs/                              folder
   📄  hello.txt                            24 B
 
-Download from your computer: ssh -p 2222 download@server 'download hello.txt' > hello.txt
-[ Enter Open/View ] [ D Download ] [ B Back ] [ R Refresh ] [ Q Quit ]
+Run locally: ssh -p 2222 download@server 'upload photo.jpg' < '/home/me/photo.jpg'
+[ Enter Open/View ] [ D Download ] [ U Upload ] [ B Back ] [ R Refresh ] [ Q Quit ]
 ```
 
 ## Build
@@ -48,6 +49,13 @@ Choose a directory that SSDOV is allowed to serve, for example `/srv/downloads`.
 ```bash
 export SSHDOWN_PASSWORD='change-this-password'
 ./ssdov -addr :2222 -root /srv/downloads -user download
+```
+
+Enable uploads by adding `-upload`:
+
+```bash
+export SSHDOWN_PASSWORD='change-this-password'
+./ssdov -addr :2222 -root /srv/downloads -user download -upload
 ```
 
 ### Public-key auth
@@ -73,6 +81,7 @@ TUI keys:
 ↑/↓ or j/k       move selection
 Enter            open folder or preview file
 d                show download command for selected file
+u                upload helper: paste/drag local path, then keep or rename
 b / Backspace    go back
 r                refresh
 q / Esc          quit
@@ -93,12 +102,23 @@ ssh -p 2222 download@server-ip 'download docs/readme.md' > readme.md
 
 Direct download mode writes the file bytes to stdout, so redirects and scripts work naturally.
 
+### Upload a file
+
+Start the server with `-upload`, then upload from the client with stdin redirection:
+
+```bash
+ssh -p 2222 download@server-ip 'upload uploads/photo.jpg' < /local/path/photo.jpg
+```
+
+You can also press `u` in the TUI. SSDOV will ask you to paste or drag a local file path into the terminal, then lets you press Enter to keep the same filename or type a different remote filename. Because SSH TUIs cannot read client files directly, SSDOV shows the exact command to run locally.
+
 ## Direct commands
 
 ```text
 ls [path]            list files under the download root
 stat <path>          show file or directory info
 download <file>      stream file bytes to stdout
+upload <file>        stream stdin bytes into a new file (--upload required)
 cat <file>           same as download
 help                 show help
 exit                 leave the basic shell

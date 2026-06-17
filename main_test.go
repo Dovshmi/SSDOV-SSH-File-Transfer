@@ -99,6 +99,51 @@ func TestDownloadDirectoryIsRejected(t *testing.T) {
 	}
 }
 
+func TestUploadDisabledRejectsUpload(t *testing.T) {
+	app := makeTestApp(t)
+	var out bytes.Buffer
+	code := app.RunCommandIO([]string{"upload", "new.txt"}, strings.NewReader("hello"), &out)
+	if code == 0 {
+		t.Fatalf("expected upload to fail when disabled")
+	}
+	if !strings.Contains(out.String(), "upload disabled") {
+		t.Fatalf("expected upload disabled message, got %q", out.String())
+	}
+}
+
+func TestUploadEnabledWritesStdinToDestination(t *testing.T) {
+	app := makeTestApp(t)
+	app.AllowUpload = true
+	var out bytes.Buffer
+	code := app.RunCommandIO([]string{"upload", "new.txt"}, strings.NewReader("uploaded bytes\n"), &out)
+	if code != 0 {
+		t.Fatalf("upload exit code = %d, output=%q", code, out.String())
+	}
+	got, err := os.ReadFile(filepath.Join(app.Root, "new.txt"))
+	if err != nil {
+		t.Fatalf("uploaded file missing: %v", err)
+	}
+	if string(got) != "uploaded bytes\n" {
+		t.Fatalf("uploaded contents=%q", string(got))
+	}
+	if !strings.Contains(out.String(), "uploaded new.txt") {
+		t.Fatalf("expected upload success message, got %q", out.String())
+	}
+}
+
+func TestUploadRejectsTraversalAbsoluteAndOverwrite(t *testing.T) {
+	app := makeTestApp(t)
+	app.AllowUpload = true
+
+	for _, dest := range []string{"../evil.txt", "/tmp/evil.txt", "hello.txt"} {
+		var out bytes.Buffer
+		code := app.RunCommandIO([]string{"upload", dest}, strings.NewReader("bad"), &out)
+		if code == 0 {
+			t.Fatalf("expected upload %q to fail", dest)
+		}
+	}
+}
+
 func TestInteractiveAcceptsCarriageReturnFromPTYClients(t *testing.T) {
 	app := makeTestApp(t)
 	rw := newScriptedRW("ls\rexit\r")

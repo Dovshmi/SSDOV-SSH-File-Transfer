@@ -9,7 +9,9 @@ import (
 
 func TestTUIViewLooksModernAndShowsButtons(t *testing.T) {
 	app := makeTestApp(t)
+	app.AllowUpload = true
 	m := newTUIModel(app, "download@server", 2222)
+	m.width = 120
 	view := m.View()
 
 	for _, want := range []string{
@@ -17,6 +19,7 @@ func TestTUIViewLooksModernAndShowsButtons(t *testing.T) {
 		"hello.txt",
 		"[ Enter Open/View ]",
 		"[ D Download ]",
+		"[ U Upload ]",
 		"[ Q Quit ]",
 	} {
 		if !strings.Contains(view, want) {
@@ -73,6 +76,76 @@ func TestTUIEnterOpensDirectory(t *testing.T) {
 	}
 	if indexOfEntry(t, m.entries, "readme.md") < 0 {
 		t.Fatalf("docs directory entries do not include readme.md: %#v", m.entries)
+	}
+}
+
+func TestTUIUploadDisabledShowsMessage(t *testing.T) {
+	app := makeTestApp(t)
+	m := newTUIModel(app, "download@server", 2222)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = next.(tuiModel)
+
+	if !strings.Contains(m.message, "Upload is disabled") {
+		t.Fatalf("expected disabled upload message, got %q", m.message)
+	}
+}
+
+func TestTUIUploadHelperUsesDraggedPathAndSameName(t *testing.T) {
+	app := makeTestApp(t)
+	app.AllowUpload = true
+	m := newTUIModel(app, "download@nas", 2222)
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = next.(tuiModel)
+	if m.mode != tuiModeUploadPath {
+		t.Fatalf("mode after u=%v, want upload path", m.mode)
+	}
+
+	for _, r := range []rune(`C:\Users\me\Downloads\photo.jpg`) {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(tuiModel)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(tuiModel)
+	if m.mode != tuiModeUploadName {
+		t.Fatalf("mode after local path enter=%v, want upload name", m.mode)
+	}
+	if m.uploadRemoteName != "photo.jpg" {
+		t.Fatalf("default remote name=%q, want photo.jpg", m.uploadRemoteName)
+	}
+
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(tuiModel)
+	for _, want := range []string{"ssh -p 2222 download@nas", "upload photo.jpg", "<", "photo.jpg"} {
+		if !strings.Contains(m.message, want) {
+			t.Fatalf("upload helper missing %q: %q", want, m.message)
+		}
+	}
+}
+
+func TestTUIUploadHelperCanRenameRemoteFile(t *testing.T) {
+	app := makeTestApp(t)
+	app.AllowUpload = true
+	m := newTUIModel(app, "download@nas", 2222)
+	m.relDir = "docs"
+
+	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
+	m = next.(tuiModel)
+	for _, r := range []rune(`/home/me/file.txt`) {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(tuiModel)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(tuiModel)
+	for _, r := range []rune(`renamed.txt`) {
+		next, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = next.(tuiModel)
+	}
+	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = next.(tuiModel)
+	if !strings.Contains(m.message, "upload docs/renamed.txt") {
+		t.Fatalf("expected renamed upload destination, got %q", m.message)
 	}
 }
 

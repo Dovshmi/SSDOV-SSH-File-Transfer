@@ -22,7 +22,8 @@ import (
 )
 
 type App struct {
-	Root string
+	Root        string
+	AllowUpload bool
 }
 
 func (a App) ResolvePath(userPath string) (string, error) {
@@ -52,6 +53,10 @@ func (a App) ResolvePath(userPath string) (string, error) {
 }
 
 func (a App) RunCommand(args []string, out io.Writer) int {
+	return a.RunCommandIO(args, strings.NewReader(""), out)
+}
+
+func (a App) RunCommandIO(args []string, in io.Reader, out io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(out, helpText())
 		return 0
@@ -73,6 +78,12 @@ func (a App) RunCommand(args []string, out io.Writer) int {
 			return 2
 		}
 		return a.download(args[1], out)
+	case "upload", "put":
+		if len(args) != 2 {
+			fmt.Fprintln(out, "usage: upload <destination-file>")
+			return 2
+		}
+		return a.upload(args[1], in, out)
 	case "stat":
 		if len(args) != 2 {
 			fmt.Fprintln(out, "usage: stat <path>")
@@ -136,6 +147,64 @@ func (a App) download(userPath string, out io.Writer) int {
 		fmt.Fprintln(out, err)
 		return 1
 	}
+	return 0
+}
+
+func (a App) upload(userPath string, in io.Reader, out io.Writer) int {
+	if !a.AllowUpload {
+		fmt.Fprintln(out, "upload disabled; restart server with --upload to enable uploads")
+		return 1
+	}
+	p, err := a.ResolvePath(userPath)
+	if err != nil {
+		fmt.Fprintln(out, err)
+		return 1
+	}
+	if info, err := os.Stat(p); err == nil {
+		if info.IsDir() {
+			fmt.Fprintf(out, "%s is a directory; choose a destination filename\n", userPath)
+			return 1
+		}
+		fmt.Fprintf(out, "%s already exists; refusing to overwrite\n", userPath)
+		return 1
+	} else if !errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(out, err)
+		return 1
+	}
+
+	parent := filepath.Dir(p)
+	if info, err := os.Stat(parent); err != nil || !info.IsDir() {
+		fmt.Fprintf(out, "destination folder does not exist: %s\n", filepath.ToSlash(filepath.Dir(userPath)))
+		return 1
+	}
+
+	tmp, err := os.CreateTemp(parent, ".ssdov-upload-*")
+	if err != nil {
+		fmt.Fprintln(out, err)
+		return 1
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	n, copyErr := io.Copy(tmp, in)
+	closeErr := tmp.Close()
+	if copyErr != nil {
+		fmt.Fprintln(out, copyErr)
+		return 1
+	}
+	if closeErr != nil {
+		fmt.Fprintln(out, closeErr)
+		return 1
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		fmt.Fprintln(out, err)
+		return 1
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		fmt.Fprintln(out, err)
+		return 1
+	}
+	fmt.Fprintf(out, "uploaded %s (%d bytes)\n", filepath.ToSlash(userPath), n)
 	return 0
 }
 
@@ -232,13 +301,15 @@ func helpText() string {
   ls [path]            list files under the download root
   stat <path>          show file/dir info
   download <file>      stream file bytes to stdout
+  upload <file>        stream stdin bytes into a new server file (--upload required)
   cat <file>           same as download
   help                 show this help
   exit                 leave interactive shell
 
 examples from your client machine:
   ssh -p 2222 download@server ls
-  ssh -p 2222 download@server 'download docs/readme.md' > readme.md`)
+  ssh -p 2222 download@server 'download docs/readme.md' > readme.md
+  ssh -p 2222 download@server 'upload docs/photo.jpg' < photo.jpg`)
 }
 
 func appMiddleware(app App) wish.Middleware {
@@ -246,7 +317,7 @@ func appMiddleware(app App) wish.Middleware {
 		return func(s ssh.Session) {
 			args := s.Command()
 			if len(args) > 0 {
-				code := app.RunCommand(args, s)
+				code := app.RunCommandIO(args, s, s)
 				_ = s.Exit(code)
 				return
 			}
@@ -270,6 +341,7 @@ func main() {
 		root    = flag.String("root", envDefault("SSHDOWN_ROOT", "."), "download root directory")
 		hostKey = flag.String("host-key", envDefault("SSHDOWN_HOST_KEY", "./sshdown_host_ed25519"), "SSH host key path; created by wish if missing")
 		user    = flag.String("user", envDefault("SSHDOWN_USER", "download"), "allowed SSH username")
+		upload  = flag.Bool("upload", envDefaultBool("SSHDOWN_UPLOAD", false), "enable upload command")
 	)
 	flag.Parse()
 
@@ -288,7 +360,7 @@ func main() {
 		log.Fatal("refusing to start without auth; set SSHDOWN_PASSWORD, SSHDOWN_AUTHORIZED_KEYS, or SSHDOWN_INSECURE_ALLOW_ANY=1 for local testing")
 	}
 
-	app := App{Root: absRoot}
+	app := App{Root: absRoot, AllowUpload: *upload}
 	opts := []ssh.Option{
 		wish.WithAddress(*addr),
 		wish.WithHostKeyPath(*hostKey),
@@ -331,4 +403,12 @@ func envDefault(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envDefaultBool(key string, fallback bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	if v == "" {
+		return fallback
+	}
+	return v == "1" || v == "true" || v == "yes" || v == "on"
 }

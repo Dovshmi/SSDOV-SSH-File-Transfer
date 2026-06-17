@@ -9,6 +9,7 @@ Environment=SSHDOWN_PASSWORD=change-this-password
 # Or use public-key auth instead:
 # Environment=SSHDOWN_AUTHORIZED_KEYS=/home/YOURUSER/.ssh/authorized_keys
 ExecStart=/home/YOURUSER/ssh-downloader/ssdov -addr :2222 -root /srv/downloads -user download
+# To enable uploads, add -upload to ExecStart.
 Restart=on-failure
 RestartSec=3
 

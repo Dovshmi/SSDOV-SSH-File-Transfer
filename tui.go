@@ -16,6 +16,14 @@ import (
 
 type tickMsg time.Time
 
+type tuiMode int
+
+const (
+	tuiModeBrowse tuiMode = iota
+	tuiModeUploadPath
+	tuiModeUploadName
+)
+
 type tuiEntry struct {
 	Name  string
 	IsDir bool
@@ -23,18 +31,22 @@ type tuiEntry struct {
 }
 
 type tuiModel struct {
-	app       App
-	relDir    string
-	entries   []tuiEntry
-	cursor    int
-	width     int
-	height    int
-	message   string
-	viewer    string
-	tick      int
-	remote    string
-	port      int
-	lastError string
+	app              App
+	relDir           string
+	entries          []tuiEntry
+	cursor           int
+	width            int
+	height           int
+	message          string
+	viewer           string
+	tick             int
+	remote           string
+	port             int
+	lastError        string
+	mode             tuiMode
+	input            string
+	uploadLocalPath  string
+	uploadRemoteName string
 }
 
 func runTUIInSession(app App, s ssh.Session) error {
@@ -76,7 +88,7 @@ func newTUIModel(app App, remote string, port int) tuiModel {
 		port:    port,
 		width:   80,
 		height:  24,
-		message: "Use ↑/↓ or j/k, Enter to open/view, D for download command.",
+		message: initialTUIMessage(app.AllowUpload),
 	}
 	m.loadEntries()
 	return m
@@ -100,6 +112,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		return m, nil
 	case tea.KeyMsg:
+		if m.mode != tuiModeBrowse {
+			return m.updateUploadInput(msg), nil
+		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			return m, tea.Quit
@@ -130,9 +145,67 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openSelected()
 		case "d":
 			m.downloadSelected()
+		case "u":
+			m.startUploadHelper()
 		}
 	}
 	return m, nil
+}
+
+func initialTUIMessage(allowUpload bool) string {
+	if allowUpload {
+		return "Use ↑/↓ or j/k, Enter to open/view, D download, U upload helper."
+	}
+	return "Use ↑/↓ or j/k, Enter to open/view, D for download command."
+}
+
+func (m tuiModel) updateUploadInput(msg tea.KeyMsg) tuiModel {
+	switch msg.String() {
+	case "esc", "ctrl+c":
+		m.mode = tuiModeBrowse
+		m.input = ""
+		m.message = "Upload cancelled."
+	case "backspace":
+		if len(m.input) > 0 {
+			m.input = m.input[:len(m.input)-1]
+		}
+	case "enter":
+		m.finishUploadInput()
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.input += string(msg.Runes)
+		}
+	}
+	return m
+}
+
+func (m *tuiModel) finishUploadInput() {
+	switch m.mode {
+	case tuiModeUploadPath:
+		localPath := strings.TrimSpace(m.input)
+		if localPath == "" {
+			m.message = "Paste or drag a local file path first. Esc cancels."
+			return
+		}
+		m.uploadLocalPath = localPath
+		m.uploadRemoteName = clientPathBase(localPath)
+		m.input = ""
+		m.mode = tuiModeUploadName
+		m.message = "Remote filename: press Enter for same name, or type a new name."
+	case tuiModeUploadName:
+		name := strings.TrimSpace(m.input)
+		if name == "" {
+			name = m.uploadRemoteName
+		}
+		if name == "" {
+			m.message = "Remote filename cannot be empty."
+			return
+		}
+		dest := filepath.ToSlash(filepath.Join(m.relDir, name))
+		m.message = fmt.Sprintf("Run locally: ssh -p %d %s 'upload %s' < %s", m.port, m.remote, shellQuoteInsideSingle(dest), shellQuoteArg(m.uploadLocalPath))
+		m.mode = tuiModeBrowse
+		m.input = ""
+	}
 }
 
 func (m *tuiModel) loadEntries() {
@@ -231,6 +304,18 @@ func (m *tuiModel) downloadSelected() {
 	m.message = fmt.Sprintf("Download from your computer: ssh -p %d %s 'download %s' > %s", m.port, m.remote, shellQuoteInsideSingle(path), out)
 }
 
+func (m *tuiModel) startUploadHelper() {
+	if !m.app.AllowUpload {
+		m.message = "Upload is disabled. Restart the server with --upload to enable it."
+		return
+	}
+	m.mode = tuiModeUploadPath
+	m.input = ""
+	m.uploadLocalPath = ""
+	m.uploadRemoteName = ""
+	m.message = "Paste or drag a local file path here, then press Enter."
+}
+
 func (m *tuiModel) goParent() {
 	if m.relDir == "" || m.relDir == "." {
 		m.message = "Already at the download root."
@@ -250,6 +335,28 @@ func shellQuoteInsideSingle(s string) string {
 	return strings.ReplaceAll(s, "'", "'\\''")
 }
 
+func shellQuoteArg(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "''"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+func clientPathBase(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.Trim(p, "\"'")
+	p = strings.ReplaceAll(p, "\\", "/")
+	p = strings.TrimRight(p, "/")
+	if p == "" {
+		return ""
+	}
+	if i := strings.LastIndex(p, "/"); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
 func (m tuiModel) View() string {
 	spin := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 	spinner := spin[m.tick%len(spin)]
@@ -267,8 +374,11 @@ func (m tuiModel) View() string {
 	if m.lastError != "" {
 		body += "\n" + errorStyle.Render(m.lastError)
 	}
+	if m.mode != tuiModeBrowse {
+		body += "\n" + uploadInputStyle.Render(m.uploadPrompt()+"\n"+m.input)
+	}
 	msg := messageStyle.Width(max(40, m.width-4)).Render(m.message)
-	buttons := renderButtons()
+	buttons := renderButtons(m.app.AllowUpload)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, title, pathLine, "", body, "", msg, buttons)
 	return appStyle.Width(max(50, m.width-2)).Render(content)
@@ -306,15 +416,31 @@ func (m tuiModel) renderEntries() string {
 	return strings.Join(lines, "\n")
 }
 
-func renderButtons() string {
+func renderButtons(allowUpload bool) string {
 	buttons := []string{
 		buttonStyle.Render("[ Enter Open/View ]"),
 		buttonStyle.Render("[ D Download ]"),
+	}
+	if allowUpload {
+		buttons = append(buttons, buttonStyle.Render("[ U Upload ]"))
+	}
+	buttons = append(buttons,
 		buttonStyle.Render("[ B Back ]"),
 		buttonStyle.Render("[ R Refresh ]"),
 		dangerButtonStyle.Render("[ Q Quit ]"),
-	}
+	)
 	return lipgloss.JoinHorizontal(lipgloss.Top, buttons...)
+}
+
+func (m tuiModel) uploadPrompt() string {
+	switch m.mode {
+	case tuiModeUploadPath:
+		return "Local file path (drag/paste here, Enter):"
+	case tuiModeUploadName:
+		return fmt.Sprintf("Remote filename (Enter = %s):", m.uploadRemoteName)
+	default:
+		return ""
+	}
 }
 
 func truncateLines(s string, maxLines int) string {
@@ -396,6 +522,12 @@ var (
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(lipgloss.Color("62")).
 			Padding(0, 1)
+
+	uploadInputStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("70")).
+				Foreground(lipgloss.Color("229")).
+				Padding(0, 1)
 
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196")).
