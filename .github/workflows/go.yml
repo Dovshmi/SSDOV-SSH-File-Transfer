@@ -1,28 +1,111 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
-name: Go
+name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+permissions:
+  contents: read
 
 jobs:
-
-  build:
+  test:
+    name: Format, test, and build
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.20'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
 
-    - name: Build
-      run: go build -v ./...
+      - name: Download dependencies
+        run: go mod download
 
-    - name: Test
-      run: go test -v ./...
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Go files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run all Go tests
+        run: go test -v ./...
+
+      - name: Run focused SCP/TUI protocol tests
+        run: go test -v -run 'TestSCP|TestTUI' ./...
+
+      - name: Build binaries
+        run: |
+          go build -o ssdov .
+          go build -o ssh-downloader .
+          ./ssdov -h 2>&1 | grep -F -- '-addr string'
+          ./ssh-downloader -h 2>&1 | grep -F -- '-addr string'
+
+      - name: Integration smoke test over SSH/SCP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SMOKE_DIR=$(mktemp -d)
+          SERVER_PID=""
+          cleanup() {
+            if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+              kill "$SERVER_PID" || true
+              wait "$SERVER_PID" || true
+            fi
+            rm -rf "$SMOKE_DIR"
+          }
+          trap cleanup EXIT
+
+          mkdir -p "$SMOKE_DIR/root/docs/nested" "$SMOKE_DIR/upload"
+          printf '# docs\n' > "$SMOKE_DIR/root/docs/readme.md"
+          printf 'note\n' > "$SMOKE_DIR/root/docs/nested/note.txt"
+          ssh-keygen -q -t ed25519 -N '' -f "$SMOKE_DIR/id_ed25519"
+
+          export SSHDOWN_AUTHORIZED_KEYS="$SMOKE_DIR/id_ed25519.pub"
+          ./ssdov \
+            -addr 127.0.0.1:22663 \
+            -root "$SMOKE_DIR/root" \
+            -upload "$SMOKE_DIR/upload" \
+            -user download \
+            -host-key "$SMOKE_DIR/hostkey" \
+            >"$SMOKE_DIR/server.log" 2>&1 &
+          SERVER_PID=$!
+
+          SSH_OPTS="-i $SMOKE_DIR/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PasswordAuthentication=no"
+          for _ in $(seq 1 50); do
+            if ssh -p 22663 $SSH_OPTS download@127.0.0.1 help >/tmp/ssdov-help-smoke.txt 2>/tmp/ssdov-help-smoke.err; then
+              break
+            fi
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "SSDOV server exited early"
+              cat "$SMOKE_DIR/server.log"
+              exit 1
+            fi
+            sleep 0.2
+          done
+
+          ssh -p 22663 $SSH_OPTS download@127.0.0.1 'download docs/readme.md' > "$SMOKE_DIR/direct-readme.md"
+          cmp "$SMOKE_DIR/root/docs/readme.md" "$SMOKE_DIR/direct-readme.md"
+
+          mkdir -p "$SMOKE_DIR/downloaded"
+          (
+            cd "$SMOKE_DIR/downloaded"
+            scp -O -r -P 22663 $SSH_OPTS download@127.0.0.1:docs .
+          )
+          cmp "$SMOKE_DIR/root/docs/readme.md" "$SMOKE_DIR/downloaded/docs/readme.md"
+          cmp "$SMOKE_DIR/root/docs/nested/note.txt" "$SMOKE_DIR/downloaded/docs/nested/note.txt"
+
+          mkdir -p "$SMOKE_DIR/client_folder/sub"
+          printf 'upload root\n' > "$SMOKE_DIR/client_folder/a.txt"
+          printf 'upload nested\n' > "$SMOKE_DIR/client_folder/sub/b.txt"
+          scp -O -r -P 22663 $SSH_OPTS "$SMOKE_DIR/client_folder" download@127.0.0.1:client_folder
+          cmp "$SMOKE_DIR/client_folder/a.txt" "$SMOKE_DIR/upload/client_folder/a.txt"
+          cmp "$SMOKE_DIR/client_folder/sub/b.txt" "$SMOKE_DIR/upload/client_folder/sub/b.txt"

@@ -12,7 +12,7 @@ Default SSDOV port: `2222`
 - Modern Bubble Tea + Lip Gloss terminal UI
 - File/folder navigation over SSH
 - File preview in the TUI
-- Download command hints for selected files
+- SCP download command copy/hints for selected files and folders
 - Direct non-interactive commands for scripts
 - Optional legacy SCP upload support with `scp -O`
 - Password authentication and/or public-key authentication
@@ -38,7 +38,7 @@ Run locally: scp -O -P 2222 '/home/me/photo.jpg' 'download@server:photo.jpg'
 
 - Go, matching the version in `go.mod`
 - An SSH client on the client machine
-- `scp` with legacy SCP mode support for uploads, usually enabled with `scp -O`
+- `scp` with legacy SCP mode support, usually enabled with `scp -O`
 - Linux + systemd only if you want the systemd user service option
 
 ## Build
@@ -116,10 +116,11 @@ export SSHDOWN_PASSWORD='change-this-password'
 ./ssdov -addr :2222 -root /srv/downloads -user download -upload /srv/uploads
 ```
 
-Then upload from a client with legacy SCP mode:
+Then upload files or folders from a client with legacy SCP mode:
 
 ```bash
 scp -O -P 2222 /local/path/photo.jpg download@server-ip:photo.jpg
+scp -O -r -P 2222 /local/path/folder download@server-ip:folder
 ```
 
 ### Same folder for downloads and uploads
@@ -195,7 +196,7 @@ ssh -p 2222 download@server-ip
 | `PgDown` | Move down by 10 rows |
 | `Enter` / `Right` / `l` | Open folder or preview file |
 | `Backspace` / `Left` / `h` / `b` | Go to parent folder |
-| `d` | Show a download command for the selected file |
+| `d` | Copy/show an `scp -O` download command for the selected file or folder |
 | `u` | Start the upload helper, only if uploads are enabled |
 | `r` | Refresh current folder |
 | `q` / `Esc` / `Ctrl+C` | Quit |
@@ -211,7 +212,9 @@ When the TUI upload helper is open:
 | `Backspace` | Edit input |
 | `Esc` / `Ctrl+C` | Cancel upload helper |
 
-The upload helper shows the exact `scp -O` command to run locally. Some terminals may also copy the command automatically using OSC52 clipboard support.
+The download and upload helpers show exact `scp -O` commands to run locally. Some terminals may also copy the command automatically using OSC52 clipboard support.
+
+Note: an interactive SSH TUI cannot directly create a file on your local computer when you press `d`; the local SSH/SCP client must request the transfer. The `d` key copies/shows the SCP command that performs the download.
 
 ## Direct commands
 
@@ -243,9 +246,15 @@ ssh -p 2222 download@server-ip 'stat docs/readme.md'
 ssh -p 2222 download@server-ip 'download docs/readme.md' > readme.md
 ssh -p 2222 download@server-ip 'cat docs/readme.md' > readme.md
 ssh -p 2222 download@server-ip 'get docs/readme.md' > readme.md
+scp -O -P 2222 download@server-ip:docs/readme.md .
+scp -O -r -P 2222 download@server-ip:docs .
 ```
 
-Direct download mode writes the raw file bytes to stdout, so redirects and scripts work naturally.
+Direct download mode writes raw file bytes to stdout, so redirects and scripts work naturally. For folders, use legacy recursive SCP:
+
+```bash
+scp -O -r -P 2222 download@server-ip:docs .
+```
 
 ## Uploads with SCP
 
@@ -253,13 +262,13 @@ Uploads are disabled by default. Start the server with `-upload <server-director
 
 ```bash
 scp -O -P 2222 /local/path/photo.jpg download@server-ip:photo.jpg
+scp -O -r -P 2222 /local/path/folder download@server-ip:folder
 ```
 
 Upload rules:
 
 - Only legacy SCP upload mode is supported, so use `scp -O`.
-- Uploads must be single files.
-- Recursive directory upload is not supported.
+- Uploads can be single files or recursive folders with `scp -O -r`.
 - The server-side destination must be a plain filename, not a path.
 - SSDOV always saves uploads inside the configured upload directory.
 - Existing files are not overwritten.
@@ -270,6 +279,7 @@ Good upload destinations:
 ```bash
 scp -O -P 2222 photo.jpg download@server-ip:photo.jpg
 scp -O -P 2222 archive.zip download@server-ip:backup.zip
+scp -O -r -P 2222 myfolder download@server-ip:myfolder
 ```
 
 Rejected upload destinations:
@@ -277,7 +287,7 @@ Rejected upload destinations:
 ```bash
 scp -O -P 2222 photo.jpg download@server-ip:../photo.jpg
 scp -O -P 2222 photo.jpg download@server-ip:subfolder/photo.jpg
-scp -O -r -P 2222 myfolder download@server-ip:myfolder
+scp -O -r -P 2222 myfolder download@server-ip:subfolder/myfolder
 ```
 
 ## Paths and security behavior
@@ -305,9 +315,10 @@ Important security notes:
 - SSDOV only serves downloads from files under `-root`.
 - Absolute paths and `..` traversal are rejected for download paths.
 - SCP uploads are disabled unless `-upload <directory>` is set.
-- SCP upload destinations must be plain filenames.
+- SCP upload destinations must be plain top-level file/folder names.
 - The server always saves uploads inside the configured upload directory.
 - Existing uploaded files are not overwritten.
+- Recursive SCP rejects symlinks and unsupported special files by default.
 - Set `SSHDOWN_PASSWORD` or `SSHDOWN_AUTHORIZED_KEYS` before starting.
 - `SSHDOWN_INSECURE_ALLOW_ANY=1` is only for local testing.
 - Do not commit generated host keys, passwords, private keys, or real server configuration to GitHub.
@@ -373,8 +384,14 @@ ssh -p 2222 download@server-ip 'ls docs'
 # Download a file
 ssh -p 2222 download@server-ip 'download docs/readme.md' > readme.md
 
+# Download a folder
+scp -O -r -P 2222 download@server-ip:docs .
+
 # Upload a file when uploads are enabled
 scp -O -P 2222 photo.jpg download@server-ip:photo.jpg
+
+# Upload a folder when uploads are enabled
+scp -O -r -P 2222 myfolder download@server-ip:myfolder
 ```
 
 ## Troubleshooting
@@ -406,13 +423,14 @@ export SSHDOWN_PASSWORD='change-this-password'
 ./ssdov -root /srv/downloads
 ```
 
-### Upload does not work
+### Upload or folder transfer does not work
 
-Make sure the server was started with `-upload` and that the client uses `scp -O`:
+Make sure the server was started with `-upload` and that the client uses legacy SCP mode. Folder transfers also need `-r`:
 
 ```bash
 ./ssdov -root /srv/downloads -upload /srv/uploads
 scp -O -P 2222 file.txt download@server-ip:file.txt
+scp -O -r -P 2222 myfolder download@server-ip:myfolder
 ```
 
 ### Port already in use
@@ -426,19 +444,27 @@ ssh -p 2223 download@server-ip
 
 ## Development
 
-Run tests:
+Run the same checks CI runs:
 
 ```bash
+unformatted=$(gofmt -l .); test -z "$unformatted"
 go test ./...
+go build -o ssdov .
+go build -o ssh-downloader .
 ```
 
-Build:
+Focused SCP/TUI protocol tests:
 
 ```bash
-go build -o ssdov .
+go test -v -run 'TestSCP|TestTUI' ./...
 ```
 
-Format:
+GitHub Actions also runs a Linux integration smoke test that starts SSDOV locally and verifies:
+- direct SSH command execution
+- recursive `scp -O -r` folder download
+- recursive `scp -O -r` folder upload
+
+Format code before committing:
 
 ```bash
 gofmt -w .

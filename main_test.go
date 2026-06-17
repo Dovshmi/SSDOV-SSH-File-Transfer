@@ -39,6 +39,8 @@ func makeTestApp(t *testing.T) App {
 	must(os.WriteFile(filepath.Join(root, "hello.txt"), []byte("hello over ssh\n"), 0o644))
 	must(os.Mkdir(filepath.Join(root, "docs"), 0o755))
 	must(os.WriteFile(filepath.Join(root, "docs", "readme.md"), []byte("# docs\n"), 0o644))
+	must(os.Mkdir(filepath.Join(root, "docs", "nested"), 0o755))
+	must(os.WriteFile(filepath.Join(root, "docs", "nested", "note.txt"), []byte("note\n"), 0o644))
 	return App{Root: root}
 }
 
@@ -125,6 +127,48 @@ func TestSCPUploadDisabledRejectsUpload(t *testing.T) {
 	}
 }
 
+func TestSCPDownloadSourceStreamsFileProtocol(t *testing.T) {
+	app := makeTestApp(t)
+	var out bytes.Buffer
+	code := app.RunCommandIO([]string{"scp", "-f", "hello.txt"}, strings.NewReader("\x00\x00\x00"), &out)
+	if code != 0 {
+		t.Fatalf("scp download exit code = %d, output=%q", code, out.String())
+	}
+	want := "C0644 15 hello.txt\nhello over ssh\n\x00"
+	if out.String() != want {
+		t.Fatalf("scp download protocol output=%q, want %q", out.String(), want)
+	}
+}
+
+func TestSCPDownloadRejectsDirectoriesAndTraversal(t *testing.T) {
+	app := makeTestApp(t)
+	for _, target := range []string{"docs", "../secret.txt", "/etc/passwd"} {
+		var out bytes.Buffer
+		code := app.RunCommandIO([]string{"scp", "-f", target}, strings.NewReader("\x00"), &out)
+		if code == 0 {
+			t.Fatalf("expected scp download %q to fail", target)
+		}
+	}
+}
+
+func TestSCPDownloadRecursiveFolderStreamsDirectoryProtocol(t *testing.T) {
+	app := makeTestApp(t)
+	var out bytes.Buffer
+	code := app.RunCommandIO([]string{"scp", "-f", "-r", "docs"}, strings.NewReader(strings.Repeat("\x00", 10)), &out)
+	if code != 0 {
+		t.Fatalf("scp recursive download exit code = %d, output=%q", code, out.String())
+	}
+	want := "D0755 0 docs\n" +
+		"D0755 0 nested\n" +
+		"C0644 5 note.txt\nnote\n\x00" +
+		"E\n" +
+		"C0644 7 readme.md\n# docs\n\x00" +
+		"E\n"
+	if out.String() != want {
+		t.Fatalf("scp recursive download protocol output=%q, want %q", out.String(), want)
+	}
+}
+
 func TestSCPUploadEnabledWritesFileToUploadDir(t *testing.T) {
 	app := makeTestApp(t)
 	app.UploadDir = t.TempDir()
@@ -143,6 +187,24 @@ func TestSCPUploadEnabledWritesFileToUploadDir(t *testing.T) {
 	}
 	if out.String() != "\x00\x00\x00" {
 		t.Fatalf("scp ack output=%q, want three NUL acks", out.String())
+	}
+}
+
+func TestSCPUploadRecursiveFlagStillAllowsSingleFile(t *testing.T) {
+	app := makeTestApp(t)
+	app.UploadDir = t.TempDir()
+	var out bytes.Buffer
+	input := "C0644 5 ignored.txt\nhello\x00"
+	code := app.RunCommandIO([]string{"scp", "-t", "-r", "file.txt"}, strings.NewReader(input), &out)
+	if code != 0 {
+		t.Fatalf("scp upload with -r exit code = %d, output=%q", code, out.String())
+	}
+	got, err := os.ReadFile(filepath.Join(app.UploadDir, "file.txt"))
+	if err != nil {
+		t.Fatalf("uploaded file missing: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("uploaded contents=%q", string(got))
 	}
 }
 
@@ -180,6 +242,50 @@ func TestSCPUploadRejectsPathTargetsAndOverwrite(t *testing.T) {
 		if code == 0 {
 			t.Fatalf("expected scp upload %q to fail", dest)
 		}
+	}
+}
+
+func TestSCPUploadRecursiveFolderWritesDirectoryTree(t *testing.T) {
+	app := makeTestApp(t)
+	app.UploadDir = t.TempDir()
+	var out bytes.Buffer
+	input := "D0755 0 folder\n" +
+		"C0644 5 a.txt\nhello\x00" +
+		"D0755 0 nested\n" +
+		"C0644 4 b.txt\nbye!\x00" +
+		"E\n" +
+		"E\n"
+	code := app.RunCommandIO([]string{"scp", "-t", "-r", "."}, strings.NewReader(input), &out)
+	if code != 0 {
+		t.Fatalf("scp recursive upload exit code = %d, output=%q", code, out.String())
+	}
+	for path, want := range map[string]string{
+		"folder/a.txt":        "hello",
+		"folder/nested/b.txt": "bye!",
+	} {
+		got, err := os.ReadFile(filepath.Join(app.UploadDir, filepath.FromSlash(path)))
+		if err != nil {
+			t.Fatalf("uploaded recursive file %s missing: %v", path, err)
+		}
+		if string(got) != want {
+			t.Fatalf("uploaded recursive file %s=%q, want %q", path, string(got), want)
+		}
+	}
+	if out.String() != strings.Repeat("\x00", 9) {
+		t.Fatalf("scp recursive ack output=%q, want nine NUL acks", out.String())
+	}
+}
+
+func TestSCPUploadRecursiveRejectsDirectoryOverwrite(t *testing.T) {
+	app := makeTestApp(t)
+	app.UploadDir = t.TempDir()
+	if err := os.Mkdir(filepath.Join(app.UploadDir, "folder"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	code := app.RunCommandIO([]string{"scp", "-t", "-r", "."}, strings.NewReader("D0755 0 folder\nE\n"), &out)
+	if code == 0 {
+		t.Fatalf("expected recursive upload overwrite to fail")
 	}
 }
 

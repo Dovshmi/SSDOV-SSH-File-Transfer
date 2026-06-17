@@ -110,7 +110,7 @@ func (a App) RunCommandIO(args []string, in io.Reader, out io.Writer) int {
 		fmt.Fprintln(out, helpText())
 		return 0
 	case "scp":
-		return a.runSCPSink(args[1:], in, out)
+		return a.runSCP(args[1:], in, out)
 	case "ls":
 		p := "."
 		if len(args) > 1 {
@@ -189,18 +189,45 @@ func (a App) download(userPath string, out io.Writer) int {
 	return 0
 }
 
-func (a App) runSCPSink(args []string, in io.Reader, out io.Writer) int {
-	target, sinkMode, err := parseSCPArgs(args)
+type scpMode int
+
+const (
+	scpModeNone scpMode = iota
+	scpModeSink
+	scpModeSource
+)
+
+type scpOptions struct {
+	target    string
+	mode      scpMode
+	recursive bool
+}
+
+func (a App) runSCP(args []string, in io.Reader, out io.Writer) int {
+	opts, err := parseSCPArgs(args)
 	if err != nil {
 		scpFatal(out, err.Error())
 		return 1
 	}
-	if !sinkMode {
-		scpFatal(out, "only legacy scp upload mode is supported; use scp -O -P <port> <file> user@host:<name>")
+	switch opts.mode {
+	case scpModeSink:
+		return a.runSCPSink(opts.target, opts.recursive, in, out)
+	case scpModeSource:
+		return a.runSCPSource(opts.target, opts.recursive, in, out)
+	default:
+		scpFatal(out, "only legacy scp upload/download mode is supported; use scp -O -P <port> user@host:<file> .")
 		return 1
 	}
+}
+
+func (a App) runSCPSink(target string, recursive bool, in io.Reader, out io.Writer) int {
 	if !a.UploadEnabled() {
 		scpFatal(out, "scp upload disabled; restart server with -upload <directory>")
+		return 1
+	}
+	uploadRoot, err := a.uploadRoot()
+	if err != nil {
+		scpFatal(out, err.Error())
 		return 1
 	}
 
@@ -208,6 +235,7 @@ func (a App) runSCPSink(args []string, in io.Reader, out io.Writer) int {
 	if err := scpAck(out); err != nil {
 		return 1
 	}
+	var dirStack []string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -228,12 +256,37 @@ func (a App) runSCPSink(args []string, in io.Reader, out io.Writer) int {
 				return 1
 			}
 		case 'D':
-			scpFatal(out, "recursive scp directory upload is not supported")
-			return 1
+			if !recursive {
+				scpFatal(out, "recursive scp directory upload requires scp -O -r")
+				return 1
+			}
+			dir, err := a.receiveSCPDir(target, line, uploadRoot, dirStack)
+			if err != nil {
+				scpFatal(out, err.Error())
+				return 1
+			}
+			dirStack = append(dirStack, dir)
+			if err := scpAck(out); err != nil {
+				return 1
+			}
 		case 'E':
-			_ = scpAck(out)
-			return 0
+			if len(dirStack) > 0 {
+				dirStack = dirStack[:len(dirStack)-1]
+			}
+			if err := scpAck(out); err != nil {
+				return 1
+			}
+			if len(dirStack) == 0 && recursive {
+				return 0
+			}
 		case 'C':
+			if len(dirStack) > 0 {
+				if err := a.receiveSCPFileInDir(dirStack[len(dirStack)-1], line, br, out); err != nil {
+					scpFatal(out, err.Error())
+					return 1
+				}
+				continue
+			}
 			if err := a.receiveSCPFile(target, line, br, out); err != nil {
 				scpFatal(out, err.Error())
 				return 1
@@ -245,28 +298,276 @@ func (a App) runSCPSink(args []string, in io.Reader, out io.Writer) int {
 	}
 }
 
-func parseSCPArgs(args []string) (target string, sinkMode bool, err error) {
+func (a App) runSCPSource(target string, recursive bool, in io.Reader, out io.Writer) int {
+	if strings.TrimSpace(target) == "" {
+		scpFatal(out, "usage: scp -O -P <port> user@host:<file> .")
+		return 1
+	}
+	p, err := a.ResolvePath(target)
+	if err != nil {
+		scpFatal(out, err.Error())
+		return 1
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		scpFatal(out, err.Error())
+		return 1
+	}
+	if info.IsDir() {
+		if !recursive {
+			scpFatal(out, fmt.Sprintf("%s is a directory; use scp -O -r", target))
+			return 1
+		}
+		if err := validateSCPSourceTree(p); err != nil {
+			scpFatal(out, err.Error())
+			return 1
+		}
+		if err := readSCPAck(in); err != nil {
+			scpFatal(out, err.Error())
+			return 1
+		}
+		if err := sendSCPDir(in, out, p, filepath.Base(filepath.Clean(target))); err != nil {
+			scpFatal(out, err.Error())
+			return 1
+		}
+		return 0
+	}
+	if !info.Mode().IsRegular() {
+		scpFatal(out, fmt.Sprintf("%s is not a regular file", target))
+		return 1
+	}
+	if err := readSCPAck(in); err != nil {
+		scpFatal(out, err.Error())
+		return 1
+	}
+	if err := sendSCPFile(in, out, p, filepath.Base(filepath.Clean(target))); err != nil {
+		scpFatal(out, err.Error())
+		return 1
+	}
+	return 0
+}
+
+func parseSCPArgs(args []string) (scpOptions, error) {
+	var opts scpOptions
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch arg {
 		case "-t":
-			sinkMode = true
-		case "-d", "-p", "-v", "-r":
-			// -d/-r are rejected later if the client sends directory messages.
-			// -p may send timestamp messages, which we acknowledge and ignore.
+			if opts.mode != scpModeNone && opts.mode != scpModeSink {
+				return scpOptions{}, errors.New("scp source and sink modes cannot be combined")
+			}
+			opts.mode = scpModeSink
+		case "-f":
+			if opts.mode != scpModeNone && opts.mode != scpModeSource {
+				return scpOptions{}, errors.New("scp source and sink modes cannot be combined")
+			}
+			opts.mode = scpModeSource
+		case "-r":
+			opts.recursive = true
+		case "-d", "-p", "-v":
+			// -d is accepted for compatibility. -p may send timestamp
+			// messages in sink mode, which we acknowledge and ignore.
 		case "--":
 			if i+1 < len(args) {
-				target = args[i+1]
+				opts.target = args[i+1]
 			}
-			return target, sinkMode, nil
+			return opts, nil
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return "", false, fmt.Errorf("unsupported scp option: %s", arg)
+				return scpOptions{}, fmt.Errorf("unsupported scp option: %s", arg)
 			}
-			target = arg
+			opts.target = arg
 		}
 	}
-	return target, sinkMode, nil
+	return opts, nil
+}
+
+func readSCPAck(in io.Reader) error {
+	var b [1]byte
+	if _, err := io.ReadFull(in, b[:]); err != nil {
+		return err
+	}
+	if b[0] == 0 {
+		return nil
+	}
+	return fmt.Errorf("scp client returned status byte %d", b[0])
+}
+
+func validateSCPSourceTree(root string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlinks are not supported in recursive scp: %s", path)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || info.Mode().IsRegular() {
+			return nil
+		}
+		return fmt.Errorf("unsupported file type in recursive scp: %s", path)
+	})
+}
+
+func sendSCPDir(in io.Reader, out io.Writer, path, name string) error {
+	if !isPlainFilename(name) {
+		return fmt.Errorf("invalid scp directory name: %s", name)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	mode := info.Mode().Perm() & 0o777
+	if mode == 0 {
+		mode = 0o755
+	}
+	if _, err := fmt.Fprintf(out, "D%04o 0 %s\n", mode, name); err != nil {
+		return err
+	}
+	if err := readSCPAck(in); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		entryPath := filepath.Join(path, entry.Name())
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if err := sendSCPDir(in, out, entryPath, entry.Name()); err != nil {
+				return err
+			}
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("unsupported file type in recursive scp: %s", entryPath)
+		}
+		if err := sendSCPFile(in, out, entryPath, entry.Name()); err != nil {
+			return err
+		}
+	}
+	if _, err := io.WriteString(out, "E\n"); err != nil {
+		return err
+	}
+	return readSCPAck(in)
+}
+
+func sendSCPFile(in io.Reader, out io.Writer, path, name string) error {
+	if !isPlainFilename(name) {
+		return fmt.Errorf("invalid scp file name: %s", name)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", path)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	mode := info.Mode().Perm() & 0o777
+	if mode == 0 {
+		mode = 0o644
+	}
+	if _, err := fmt.Fprintf(out, "C%04o %d %s\n", mode, info.Size(), name); err != nil {
+		return err
+	}
+	if err := readSCPAck(in); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, f); err != nil {
+		return err
+	}
+	if err := scpAck(out); err != nil {
+		return err
+	}
+	return readSCPAck(in)
+}
+
+func (a App) uploadRoot() (string, error) {
+	if !a.UploadEnabled() {
+		return "", errors.New("scp upload disabled; restart server with -upload <directory>")
+	}
+	uploadRoot, err := filepath.Abs(expandLeadingTilde(a.UploadDir))
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(uploadRoot)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("upload root is not a directory: %s", uploadRoot)
+	}
+	return uploadRoot, nil
+}
+
+func (a App) receiveSCPDir(target, header, uploadRoot string, dirStack []string) (string, error) {
+	mode, protoName, err := parseSCPDirHeader(header)
+	if err != nil {
+		return "", err
+	}
+	dirName := protoName
+	if len(dirStack) == 0 && target != "" && target != "." {
+		dirName = target
+	}
+	parent := uploadRoot
+	if len(dirStack) > 0 {
+		parent = dirStack[len(dirStack)-1]
+	}
+	dest, err := uploadChildPath(uploadRoot, parent, dirName)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Stat(dest); err == nil {
+		return "", fmt.Errorf("%s already exists; refusing to overwrite", dirName)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	perm := os.FileMode(mode) & 0o777
+	if perm == 0 {
+		perm = 0o755
+	}
+	if err := os.Mkdir(dest, perm); err != nil {
+		return "", err
+	}
+	return dest, nil
+}
+
+func uploadChildPath(uploadRoot, parent, name string) (string, error) {
+	if !isPlainFilename(name) {
+		return "", fmt.Errorf("upload destination must be a plain filename, not a path: %s", name)
+	}
+	parent, err := filepath.Abs(parent)
+	if err != nil {
+		return "", err
+	}
+	uploadRoot, err = filepath.Abs(uploadRoot)
+	if err != nil {
+		return "", err
+	}
+	if parent != uploadRoot && !strings.HasPrefix(parent, uploadRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes upload root: %s", parent)
+	}
+	dest := filepath.Join(parent, name)
+	dest, err = filepath.Abs(dest)
+	if err != nil {
+		return "", err
+	}
+	if dest != uploadRoot && !strings.HasPrefix(dest, uploadRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("path escapes upload root: %s", name)
+	}
+	return dest, nil
 }
 
 func (a App) receiveSCPFile(target, header string, in *bufio.Reader, out io.Writer) error {
@@ -282,11 +583,31 @@ func (a App) receiveSCPFile(target, header string, in *bufio.Reader, out io.Writ
 	if err != nil {
 		return err
 	}
+	return receiveSCPFileAt(dest, filename, mode, size, in, out)
+}
+
+func (a App) receiveSCPFileInDir(parent, header string, in *bufio.Reader, out io.Writer) error {
+	mode, size, protoName, err := parseSCPFileHeader(header)
+	if err != nil {
+		return err
+	}
+	uploadRoot, err := a.uploadRoot()
+	if err != nil {
+		return err
+	}
+	dest, err := uploadChildPath(uploadRoot, parent, protoName)
+	if err != nil {
+		return err
+	}
+	return receiveSCPFileAt(dest, protoName, mode, size, in, out)
+}
+
+func receiveSCPFileAt(dest, displayName string, mode uint64, size int64, in *bufio.Reader, out io.Writer) error {
 	if info, err := os.Stat(dest); err == nil {
 		if info.IsDir() {
-			return fmt.Errorf("%s is a directory; choose a destination filename", filename)
+			return fmt.Errorf("%s is a directory; choose a destination filename", displayName)
 		}
-		return fmt.Errorf("%s already exists; refusing to overwrite", filename)
+		return fmt.Errorf("%s already exists; refusing to overwrite", displayName)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -356,6 +677,25 @@ func parseSCPFileHeader(header string) (mode uint64, size int64, filename string
 		return 0, 0, "", fmt.Errorf("invalid scp file name: %s", filename)
 	}
 	return mode, size, filename, nil
+}
+
+func parseSCPDirHeader(header string) (mode uint64, dirname string, err error) {
+	parts := strings.SplitN(header, " ", 3)
+	if len(parts) != 3 || !strings.HasPrefix(parts[0], "D") {
+		return 0, "", fmt.Errorf("invalid scp directory header")
+	}
+	mode, err = strconv.ParseUint(parts[0][1:], 8, 32)
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid scp directory mode")
+	}
+	if _, err := strconv.ParseInt(parts[1], 10, 64); err != nil {
+		return 0, "", fmt.Errorf("invalid scp directory size")
+	}
+	dirname = parts[2]
+	if !isPlainFilename(dirname) {
+		return 0, "", fmt.Errorf("invalid scp directory name: %s", dirname)
+	}
+	return mode, dirname, nil
 }
 
 func scpAck(out io.Writer) error {
@@ -464,13 +804,21 @@ func helpText() string {
   help                 show this help
   exit                 leave interactive shell
 
+scp download:
+  scp -O -P 2222 download@server:docs/readme.md .
+  scp -O -r -P 2222 download@server:docs .
+
 scp upload, if server was started with -upload <directory>:
   scp -O -P 2222 local-file download@server:server-name
+  scp -O -r -P 2222 local-folder download@server:folder-name
 
 examples from your client machine:
   ssh -p 2222 download@server ls
   ssh -p 2222 download@server 'download docs/readme.md' > readme.md
-  scp -O -P 2222 photo.jpg download@server:photo.jpg`)
+  scp -O -P 2222 download@server:docs/readme.md .
+  scp -O -r -P 2222 download@server:docs .
+  scp -O -P 2222 photo.jpg download@server:photo.jpg
+  scp -O -r -P 2222 myfolder download@server:myfolder`)
 }
 
 func appMiddleware(app App) wish.Middleware {

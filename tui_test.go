@@ -48,18 +48,42 @@ func TestTUISelectionMovesDownAndUp(t *testing.T) {
 	}
 }
 
-func TestTUIDownloadHintUsesSelectedFile(t *testing.T) {
+func TestTUIDownloadKeyCopiesSCPDownloadCommandForSelectedFile(t *testing.T) {
 	app := makeTestApp(t)
 	m := newTUIModel(app, "download@nas", 2222)
 	m.cursor = indexOfEntry(t, m.entries, "hello.txt")
 
-	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
 	m = next.(tuiModel)
+	if cmd == nil {
+		t.Fatal("expected OSC52 clipboard command for download")
+	}
 
-	for _, want := range []string{"ssh -p 2222 download@nas", "download hello.txt", "> hello.txt"} {
+	wantCommand := "scp -O -P 2222 'download@nas:hello.txt' ."
+	if m.copyCommand != wantCommand {
+		t.Fatalf("copy command=%q, want %q", m.copyCommand, wantCommand)
+	}
+	for _, want := range []string{"SCP download command", "copied"} {
 		if !strings.Contains(m.message, want) {
-			t.Fatalf("download hint missing %q: %q", want, m.message)
+			t.Fatalf("download message missing %q: %q", want, m.message)
 		}
+	}
+}
+
+func TestTUIDownloadKeyCopiesRecursiveSCPCommandForSelectedFolder(t *testing.T) {
+	app := makeTestApp(t)
+	m := newTUIModel(app, "download@nas", 2222)
+	m.cursor = indexOfEntry(t, m.entries, "docs")
+
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = next.(tuiModel)
+	if cmd == nil {
+		t.Fatal("expected OSC52 clipboard command for folder download")
+	}
+
+	wantCommand := "scp -O -r -P 2222 'download@nas:docs' ."
+	if m.copyCommand != wantCommand {
+		t.Fatalf("copy command=%q, want %q", m.copyCommand, wantCommand)
 	}
 }
 
@@ -120,7 +144,7 @@ func TestTUIUploadHelperUsesDraggedPathAndSameName(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("expected OSC52 clipboard command")
 	}
-	wantCommand := "scp -O -P 2222 'C:\\Users\\me\\Downloads\\photo.jpg' 'download@nas:photo.jpg'"
+	wantCommand := "scp -O -r -P 2222 'C:\\Users\\me\\Downloads\\photo.jpg' 'download@nas:photo.jpg'"
 	if m.copyCommand != wantCommand {
 		t.Fatalf("copy command=%q, want %q", m.copyCommand, wantCommand)
 	}

@@ -1,7 +1,7 @@
 SSDOV / ssh-downloader handoff for future Hermes sessions
 
 Project path:
-  /home/dovshmi/ssh-downloader
+  /home/dovshmi/SSDOV-SSH-File-Transfer
 
 User preferences for this project:
   - Before meaningful code changes, explain the intended plan first.
@@ -107,7 +107,7 @@ Security/limits:
   - SCP upload is disabled unless -upload <directory> is set or setup upload folder is filled.
   - SCP upload destination must be a plain filename only, not a path.
   - Upload refuses overwrite.
-  - Recursive directory upload is not supported.
+  - Recursive directory upload/download is supported with legacy `scp -O -r`.
   - Modern scp without -O is not supported because it uses SFTP by default.
   - No SFTP subsystem exists yet.
 

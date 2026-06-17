@@ -151,7 +151,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.openSelected()
 		case "d":
 			m.copyCommand = ""
-			m.downloadSelected()
+			return m, m.downloadSelected()
 		case "u":
 			m.startUploadHelper()
 		}
@@ -163,7 +163,7 @@ func initialTUIMessage(allowUpload bool) string {
 	if allowUpload {
 		return "Use ↑/↓ or j/k, Enter to open/view, D download, U scp upload helper."
 	}
-	return "Use ↑/↓ or j/k, Enter to open/view, D for download command."
+	return "Use ↑/↓ or j/k, Enter to open/view, D for scp download command."
 }
 
 func (m tuiModel) updateUploadInput(msg tea.KeyMsg) (tuiModel, tea.Cmd) {
@@ -300,19 +300,17 @@ func (m *tuiModel) openSelected() {
 	m.message = "Preview: " + path
 }
 
-func (m *tuiModel) downloadSelected() {
+func (m *tuiModel) downloadSelected() tea.Cmd {
 	entry, ok := m.selected()
 	if !ok {
 		m.message = "No file selected."
-		return
-	}
-	if entry.IsDir {
-		m.message = "Select a file to download, not a directory."
-		return
+		return nil
 	}
 	path := filepath.ToSlash(filepath.Join(m.relDir, entry.Name))
-	out := entry.Name
-	m.message = fmt.Sprintf("Download from your computer: ssh -p %d %s 'download %s' > %s", m.port, m.remote, shellQuoteInsideSingle(path), out)
+	command := scpDownloadCommand(m.port, m.remote, path, entry.IsDir)
+	m.copyCommand = command
+	m.message = "SCP download command copied if your terminal allows it. Copy/run this one line on your computer:"
+	return osc52CopyCmd(command)
 }
 
 func (m *tuiModel) startUploadHelper() {
@@ -350,7 +348,15 @@ func shellQuoteInsideSingle(s string) string {
 
 func scpUploadCommand(port int, remote, localPath, serverName string) string {
 	remoteSpec := fmt.Sprintf("%s:%s", remote, serverName)
-	return fmt.Sprintf("scp -O -P %d %s %s", port, shellQuoteArg(localPath), shellQuoteArg(remoteSpec))
+	return fmt.Sprintf("scp -O -r -P %d %s %s", port, shellQuoteArg(localPath), shellQuoteArg(remoteSpec))
+}
+
+func scpDownloadCommand(port int, remote, serverPath string, recursive bool) string {
+	remoteSpec := fmt.Sprintf("%s:%s", remote, serverPath)
+	if recursive {
+		return fmt.Sprintf("scp -O -r -P %d %s .", port, shellQuoteArg(remoteSpec))
+	}
+	return fmt.Sprintf("scp -O -P %d %s .", port, shellQuoteArg(remoteSpec))
 }
 
 func osc52CopyCmd(text string) tea.Cmd {
@@ -420,7 +426,14 @@ func (m tuiModel) View() string {
 	if m.mode != tuiModeBrowse {
 		body += "\n" + uploadInputStyle.Render(m.uploadPrompt()+"\n"+m.input)
 	}
-	msg := messageStyle.Width(max(40, m.width-4)).Render(m.message)
+	msgWidth := max(40, m.width-4)
+	appWidth := max(50, m.width-2)
+	if m.copyCommand != "" {
+		commandWidth := lipgloss.Width(m.copyCommand) + 4
+		msgWidth = max(msgWidth, commandWidth)
+		appWidth = max(appWidth, commandWidth)
+	}
+	msg := messageStyle.Width(msgWidth).Render(m.message)
 	buttons := renderButtons(m.app.UploadEnabled())
 
 	parts := []string{title, pathLine, "", body, "", msg}
@@ -429,7 +442,7 @@ func (m tuiModel) View() string {
 	}
 	parts = append(parts, buttons)
 	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
-	return appStyle.Width(max(50, m.width-2)).Render(content)
+	return appStyle.Width(appWidth).Render(content)
 }
 
 func (m tuiModel) renderEntries() string {
