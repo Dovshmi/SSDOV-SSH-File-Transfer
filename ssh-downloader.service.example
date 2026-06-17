@@ -9,7 +9,9 @@ Environment=SSHDOWN_PASSWORD=change-this-password
 # Or use public-key auth instead:
 # Environment=SSHDOWN_AUTHORIZED_KEYS=/home/YOURUSER/.ssh/authorized_keys
 ExecStart=/home/YOURUSER/ssh-downloader/ssdov -addr :2222 -root /srv/downloads -user download
-# To enable uploads, add -upload to ExecStart.
+# To use one folder for both browsing/downloads and SCP uploads, omit -root and add:
+# ExecStart=/home/YOURUSER/ssh-downloader/ssdov -addr :2222 -user download -upload /home/YOURUSER/Downloads
+# To enable legacy SCP uploads to a different folder, add: -upload /home/YOURUSER/Downloads
 Restart=on-failure
 RestartSec=3
 

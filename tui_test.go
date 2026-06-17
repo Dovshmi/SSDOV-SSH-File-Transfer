@@ -9,7 +9,7 @@ import (
 
 func TestTUIViewLooksModernAndShowsButtons(t *testing.T) {
 	app := makeTestApp(t)
-	app.AllowUpload = true
+	app.UploadDir = t.TempDir()
 	m := newTUIModel(app, "download@server", 2222)
 	m.width = 120
 	view := m.View()
@@ -93,7 +93,7 @@ func TestTUIUploadDisabledShowsMessage(t *testing.T) {
 
 func TestTUIUploadHelperUsesDraggedPathAndSameName(t *testing.T) {
 	app := makeTestApp(t)
-	app.AllowUpload = true
+	app.UploadDir = t.TempDir()
 	m := newTUIModel(app, "download@nas", 2222)
 
 	next, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'u'}})
@@ -115,18 +115,27 @@ func TestTUIUploadHelperUsesDraggedPathAndSameName(t *testing.T) {
 		t.Fatalf("default remote name=%q, want photo.jpg", m.uploadRemoteName)
 	}
 
-	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	next, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(tuiModel)
-	for _, want := range []string{"ssh -p 2222 download@nas", "upload photo.jpg", "<", "photo.jpg"} {
-		if !strings.Contains(m.message, want) {
-			t.Fatalf("upload helper missing %q: %q", want, m.message)
-		}
+	if cmd == nil {
+		t.Fatal("expected OSC52 clipboard command")
+	}
+	wantCommand := "scp -O -P 2222 'C:\\Users\\me\\Downloads\\photo.jpg' 'download@nas:photo.jpg'"
+	if m.copyCommand != wantCommand {
+		t.Fatalf("copy command=%q, want %q", m.copyCommand, wantCommand)
+	}
+	if strings.Contains(m.message, "ssh -p") {
+		t.Fatalf("upload helper still shows old ssh command: %q", m.message)
+	}
+	view := m.View()
+	if !strings.Contains(view, wantCommand) {
+		t.Fatalf("view missing copyable one-line command %q:\n%s", wantCommand, view)
 	}
 }
 
 func TestTUIUploadHelperCanRenameRemoteFile(t *testing.T) {
 	app := makeTestApp(t)
-	app.AllowUpload = true
+	app.UploadDir = t.TempDir()
 	m := newTUIModel(app, "download@nas", 2222)
 	m.relDir = "docs"
 
@@ -144,8 +153,8 @@ func TestTUIUploadHelperCanRenameRemoteFile(t *testing.T) {
 	}
 	next, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = next.(tuiModel)
-	if !strings.Contains(m.message, "upload docs/renamed.txt") {
-		t.Fatalf("expected renamed upload destination, got %q", m.message)
+	if !strings.Contains(m.copyCommand, "download@nas:renamed.txt") {
+		t.Fatalf("expected renamed scp destination, got command %q message %q", m.copyCommand, m.message)
 	}
 }
 

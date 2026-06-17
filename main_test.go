@@ -42,6 +42,20 @@ func makeTestApp(t *testing.T) App {
 	return App{Root: root}
 }
 
+func TestChooseRootPathDefaultsToUploadDirWhenRootUnset(t *testing.T) {
+	t.Setenv("SSHDOWN_ROOT", "")
+	if got := chooseRootPath(".", "/srv/uploads", false); got != "/srv/uploads" {
+		t.Fatalf("chooseRootPath root unset = %q, want upload dir", got)
+	}
+	if got := chooseRootPath("/srv/downloads", "/srv/uploads", true); got != "/srv/downloads" {
+		t.Fatalf("chooseRootPath explicit root = %q, want explicit root", got)
+	}
+	t.Setenv("SSHDOWN_ROOT", "/env/root")
+	if got := chooseRootPath("/env/root", "/srv/uploads", false); got != "/env/root" {
+		t.Fatalf("chooseRootPath env root = %q, want env root", got)
+	}
+}
+
 func TestResolvePathKeepsDownloadsInsideRoot(t *testing.T) {
 	app := makeTestApp(t)
 	p, err := app.ResolvePath("docs/readme.md")
@@ -99,47 +113,72 @@ func TestDownloadDirectoryIsRejected(t *testing.T) {
 	}
 }
 
-func TestUploadDisabledRejectsUpload(t *testing.T) {
+func TestSCPUploadDisabledRejectsUpload(t *testing.T) {
 	app := makeTestApp(t)
 	var out bytes.Buffer
-	code := app.RunCommandIO([]string{"upload", "new.txt"}, strings.NewReader("hello"), &out)
+	code := app.RunCommandIO([]string{"scp", "-t", "new.txt"}, strings.NewReader(""), &out)
 	if code == 0 {
-		t.Fatalf("expected upload to fail when disabled")
+		t.Fatalf("expected scp upload to fail when disabled")
 	}
-	if !strings.Contains(out.String(), "upload disabled") {
+	if !strings.Contains(out.String(), "scp upload disabled") {
 		t.Fatalf("expected upload disabled message, got %q", out.String())
 	}
 }
 
-func TestUploadEnabledWritesStdinToDestination(t *testing.T) {
+func TestSCPUploadEnabledWritesFileToUploadDir(t *testing.T) {
 	app := makeTestApp(t)
-	app.AllowUpload = true
+	app.UploadDir = t.TempDir()
 	var out bytes.Buffer
-	code := app.RunCommandIO([]string{"upload", "new.txt"}, strings.NewReader("uploaded bytes\n"), &out)
+	input := "C0644 15 ignored.txt\nuploaded bytes\n\x00"
+	code := app.RunCommandIO([]string{"scp", "-t", "server-name.txt"}, strings.NewReader(input), &out)
 	if code != 0 {
-		t.Fatalf("upload exit code = %d, output=%q", code, out.String())
+		t.Fatalf("scp upload exit code = %d, output=%q", code, out.String())
 	}
-	got, err := os.ReadFile(filepath.Join(app.Root, "new.txt"))
+	got, err := os.ReadFile(filepath.Join(app.UploadDir, "server-name.txt"))
 	if err != nil {
 		t.Fatalf("uploaded file missing: %v", err)
 	}
 	if string(got) != "uploaded bytes\n" {
 		t.Fatalf("uploaded contents=%q", string(got))
 	}
-	if !strings.Contains(out.String(), "uploaded new.txt") {
-		t.Fatalf("expected upload success message, got %q", out.String())
+	if out.String() != "\x00\x00\x00" {
+		t.Fatalf("scp ack output=%q, want three NUL acks", out.String())
 	}
 }
 
-func TestUploadRejectsTraversalAbsoluteAndOverwrite(t *testing.T) {
+func TestSCPUploadUsesProtocolFilenameWhenTargetIsDot(t *testing.T) {
 	app := makeTestApp(t)
-	app.AllowUpload = true
+	app.UploadDir = t.TempDir()
+	var out bytes.Buffer
+	input := "C0644 5 photo.jpg\nhello\x00"
+	code := app.RunCommandIO([]string{"scp", "-t", "."}, strings.NewReader(input), &out)
+	if code != 0 {
+		t.Fatalf("scp upload exit code = %d, output=%q", code, out.String())
+	}
+	got, err := os.ReadFile(filepath.Join(app.UploadDir, "photo.jpg"))
+	if err != nil {
+		t.Fatalf("uploaded file missing: %v", err)
+	}
+	if string(got) != "hello" {
+		t.Fatalf("uploaded contents=%q", string(got))
+	}
+}
 
-	for _, dest := range []string{"../evil.txt", "/tmp/evil.txt", "hello.txt"} {
+func TestSCPUploadRejectsPathTargetsAndOverwrite(t *testing.T) {
+	app := makeTestApp(t)
+	app.UploadDir = t.TempDir()
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.WriteFile(filepath.Join(app.UploadDir, "exists.txt"), []byte("old"), 0o644))
+
+	for _, dest := range []string{"../evil.txt", "/tmp/evil.txt", "nested/file.txt", "exists.txt"} {
 		var out bytes.Buffer
-		code := app.RunCommandIO([]string{"upload", dest}, strings.NewReader("bad"), &out)
+		code := app.RunCommandIO([]string{"scp", "-t", dest}, strings.NewReader("C0644 3 file.txt\nbad\x00"), &out)
 		if code == 0 {
-			t.Fatalf("expected upload %q to fail", dest)
+			t.Fatalf("expected scp upload %q to fail", dest)
 		}
 	}
 }

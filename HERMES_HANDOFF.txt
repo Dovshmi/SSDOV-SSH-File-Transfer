@@ -1,0 +1,194 @@
+SSDOV / ssh-downloader handoff for future Hermes sessions
+
+Project path:
+  /home/dovshmi/ssh-downloader
+
+User preferences for this project:
+  - Before meaningful code changes, explain the intended plan first.
+  - Do not commit or push to GitHub unless the user explicitly asks.
+  - Keep replies concise and terminal-friendly.
+  - User values copy-friendly one-line commands in the TUI.
+  - User wants upload/download defaults to minimize repeated path configuration.
+
+Current uncommitted work summary:
+  Implemented legacy SCP upload support using scp -O, improved client-side TUI upload command display/copying, made download root default to upload folder when -root is not explicitly set, and added a local server-side setup/main menu for ./ssdov with no parameters.
+
+Modified / added files currently in git status:
+  Modified but not committed:
+    README.md
+    main.go
+    main_test.go
+    ssh-downloader.service.example
+    tui.go
+    tui_test.go
+
+  Untracked / added:
+    HERMES_HANDOFF.txt
+    network.go
+    service.go
+    service_test.go
+    setup_tui.go
+    setup_tui_test.go
+
+Main behavior now:
+  - Normal SSH client TUI still opens with:
+      ssh -p 2222 download@server
+
+  - Direct download still works:
+      ssh -p 2222 download@server 'download file.txt' > file.txt
+
+  - Upload uses legacy SCP only:
+      scp -O -P 2222 /local/file.jpg download@server:file.jpg
+
+  - Server enables SCP upload with:
+      ./ssdov -addr :2222 -user download -upload ~/Downloads
+
+  - Server disables upload if upload is empty/off/none/disabled/no:
+      ./ssdov -addr :2222 -root ~/Downloads -upload off
+
+  - If -upload is set and -root is NOT explicitly set, browsing/download root defaults to the upload folder.
+
+  - If both are set, explicit -root still wins:
+      ./ssdov -addr :2222 -root /srv/files -user download -upload ~/Downloads
+
+Server-side setup menu:
+  - Running ./ssdov with no parameters ALWAYS opens a local Bubble Tea setup menu before the server starts.
+  - Existing flag/env startup still works when any parameter is passed.
+  - Setup fields:
+      Port
+      Download folder/root
+      Upload folder
+      SSH username
+      Server password
+      Start on boot
+      Start server with these options
+  - Setup menu displays detected LAN/local IP:
+      Local IP: 192.168.1.183
+  - Upload field behavior:
+      Empty internally by default.
+      Empty display shows: off (SCP upload disabled)
+      If a folder is typed, display shows: <folder> (enables scp -O uploads)
+      If user types off/none/disabled/no, upload is disabled.
+  - Start on boot behavior:
+      Default: disabled
+      Press Enter or Space on the field to toggle enabled/disabled.
+      Enabled display: enabled (install user startup service)
+
+Folder creation prompt:
+  - If download folder does not exist, setup prompts instead of failing silently:
+      Folder does not exist: <path> (Download folder). Press Y to create it, N to edit.
+  - If upload folder is enabled but missing, setup prompts:
+      Folder does not exist: <path> (Upload folder). Press Y to create it, N to edit.
+  - Pressing Y uses os.MkdirAll(path, 0755).
+  - Pressing N returns cursor to the relevant folder field.
+
+Startup service behavior:
+  - If Start on boot is enabled in setup, SSDOV writes a user systemd service to:
+      ~/.config/systemd/user/ssdov.service
+  - Service file mode is set to 0600.
+  - It then runs:
+      systemctl --user daemon-reload
+      systemctl --user enable ssdov.service
+  - The service uses the currently selected setup options in ExecStart.
+  - IMPORTANT SECURITY NOTE:
+      Current implementation writes SSHDOWN_PASSWORD into the user service file if a password was entered.
+      File mode is 0600, but the password is still saved on disk.
+      Better future improvement: use authorized keys, an env-file, keyring, or ask password at start instead of writing password directly.
+
+Local IP / client command behavior:
+  - network.go has detectLocalIP(), choosing the first non-loopback IPv4 address from active interfaces.
+  - Setup menu shows this local IP.
+  - startServer logs copy-friendly client commands:
+      Client TUI: ssh -p <port> <user>@<local-ip>
+      Client upload: scp -O -P <port> local-file <user>@<local-ip>:filename
+    Upload command log only appears if upload is enabled.
+
+Security/limits:
+  - SCP upload is disabled unless -upload <directory> is set or setup upload folder is filled.
+  - SCP upload destination must be a plain filename only, not a path.
+  - Upload refuses overwrite.
+  - Recursive directory upload is not supported.
+  - Modern scp without -O is not supported because it uses SFTP by default.
+  - No SFTP subsystem exists yet.
+
+Important code details:
+  main.go:
+    - App has Root and UploadDir.
+    - serverConfig includes Addr, Root, UploadDir, HostKey, User, Password, AuthKeys, InsecureAllowAny, InstallService.
+    - startupConfig(os.Args) opens setup only when len(args)==1.
+    - flagServerConfig() preserves flag/env startup for scripts/systemd.
+    - validateServerConfig() normalizes listen addr and upload dir, validates folders/auth.
+    - normalizeUploadDir() maps empty/off/none/disabled/no to disabled empty value.
+    - startServer() installs startup service if cfg.InstallService is true, then starts Wish server.
+    - listenPort() extracts the port for client command logging.
+
+  setup_tui.go:
+    - Local server-side setup Bubble Tea model.
+    - Handles setup fields, masked password display, upload enabled/disabled explanatory text, local IP display, folder creation prompts, and Start on boot toggle.
+    - missingSetupFolder() checks root/upload folders before validateServerConfig so setup can prompt to create missing folders.
+
+  service.go:
+    - buildStartupService(cfg, binaryPath) creates the user systemd unit content.
+    - writeStartupService(cfg, binaryPath) writes ~/.config/systemd/user/ssdov.service with mode 0600.
+    - installStartupService(cfg) writes the unit, daemon-reloads, and enables it with systemctl --user.
+    - systemdQuoteArg() quotes ExecStart/environment args.
+
+  network.go:
+    - detectLocalIP() returns first active non-loopback IPv4, or "unknown".
+
+  tui.go:
+    - Client SSH TUI upload helper asks for local file path, then server filename.
+    - Generated command is built by scpUploadCommand().
+    - Command is displayed as separate raw one-line string in m.copyCommand, not only inside wrapped message box.
+    - TUI attempts OSC52 clipboard copy with osc52CopyCmd(); terminal/SSH client may block it, so the one-line command is still shown.
+    - Message after command generation: "SCP command copied if your terminal allows it. Copy/run this one line:"
+
+Build/test status:
+  Last verified commands from /home/dovshmi/ssh-downloader:
+    gofmt -w main.go setup_tui.go service.go network.go setup_tui_test.go service_test.go
+    go test ./...
+    go build -o ssdov .
+    go build -o ssh-downloader .
+
+  Result:
+    Tests passed.
+    Both binaries built.
+    ./ssdov smoke-tested: setup menu shows Local IP and Start on boot: disabled; cancelled cleanly.
+    Flag startup smoke-tested: server starts normally with flags.
+
+Built binaries:
+  /home/dovshmi/ssh-downloader/ssdov
+  /home/dovshmi/ssh-downloader/ssh-downloader
+
+Current git state when this handoff was updated:
+  Modified:
+    README.md
+    main.go
+    main_test.go
+    ssh-downloader.service.example
+    tui.go
+    tui_test.go
+
+  Untracked:
+    HERMES_HANDOFF.txt
+    network.go
+    service.go
+    service_test.go
+    setup_tui.go
+    setup_tui_test.go
+
+Next likely steps:
+  1. User should test ./ssdov on the actual server TTY and verify setup flow end-to-end.
+  2. If user enables Start on boot, verify systemd user service actually starts after login/reboot:
+       systemctl --user status ssdov.service
+       journalctl --user -u ssdov.service -f
+  3. Consider safer service password handling before relying on Start on boot long-term:
+       authorized keys, env-file with clear warning, keyring, or no saved password.
+  4. Add a saved setup config/main menu next:
+       Start server with saved setup
+       Edit setup
+       Temporary setup
+       Quit
+  5. If user tests on server and still sees old behavior, make sure the rebuilt binary is copied/restarted on 192.168.1.183.
+  6. If user wants modern scp without -O, implement an SFTP subsystem; current implementation supports only legacy SCP.
+  7. If user wants easier Windows UX, consider a PowerShell helper or small Windows CLI wrapper around scp.

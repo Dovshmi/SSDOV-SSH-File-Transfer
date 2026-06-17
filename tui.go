@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,6 +40,7 @@ type tuiModel struct {
 	width            int
 	height           int
 	message          string
+	copyCommand      string
 	viewer           string
 	tick             int
 	remote           string
@@ -88,7 +91,7 @@ func newTUIModel(app App, remote string, port int) tuiModel {
 		port:    port,
 		width:   80,
 		height:  24,
-		message: initialTUIMessage(app.AllowUpload),
+		message: initialTUIMessage(app.UploadEnabled()),
 	}
 	m.loadEntries()
 	return m
@@ -113,7 +116,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		if m.mode != tuiModeBrowse {
-			return m.updateUploadInput(msg), nil
+			updated, cmd := m.updateUploadInput(msg)
+			return updated, cmd
 		}
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
@@ -139,11 +143,14 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "backspace", "left", "h", "b":
 			m.goParent()
 		case "r":
+			m.copyCommand = ""
 			m.loadEntries()
 			m.message = "Refreshed."
 		case "enter", "right", "l":
+			m.copyCommand = ""
 			m.openSelected()
 		case "d":
+			m.copyCommand = ""
 			m.downloadSelected()
 		case "u":
 			m.startUploadHelper()
@@ -154,58 +161,62 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func initialTUIMessage(allowUpload bool) string {
 	if allowUpload {
-		return "Use ↑/↓ or j/k, Enter to open/view, D download, U upload helper."
+		return "Use ↑/↓ or j/k, Enter to open/view, D download, U scp upload helper."
 	}
 	return "Use ↑/↓ or j/k, Enter to open/view, D for download command."
 }
 
-func (m tuiModel) updateUploadInput(msg tea.KeyMsg) tuiModel {
+func (m tuiModel) updateUploadInput(msg tea.KeyMsg) (tuiModel, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "ctrl+c":
 		m.mode = tuiModeBrowse
 		m.input = ""
+		m.copyCommand = ""
 		m.message = "Upload cancelled."
 	case "backspace":
 		if len(m.input) > 0 {
 			m.input = m.input[:len(m.input)-1]
 		}
 	case "enter":
-		m.finishUploadInput()
+		return m.finishUploadInput()
 	default:
 		if msg.Type == tea.KeyRunes {
 			m.input += string(msg.Runes)
 		}
 	}
-	return m
+	return m, nil
 }
 
-func (m *tuiModel) finishUploadInput() {
+func (m tuiModel) finishUploadInput() (tuiModel, tea.Cmd) {
 	switch m.mode {
 	case tuiModeUploadPath:
 		localPath := strings.TrimSpace(m.input)
 		if localPath == "" {
 			m.message = "Paste or drag a local file path first. Esc cancels."
-			return
+			return m, nil
 		}
 		m.uploadLocalPath = localPath
 		m.uploadRemoteName = clientPathBase(localPath)
 		m.input = ""
 		m.mode = tuiModeUploadName
-		m.message = "Remote filename: press Enter for same name, or type a new name."
+		m.message = "Server filename: press Enter for same name, or type a new name."
 	case tuiModeUploadName:
 		name := strings.TrimSpace(m.input)
 		if name == "" {
 			name = m.uploadRemoteName
 		}
-		if name == "" {
-			m.message = "Remote filename cannot be empty."
-			return
+		if !isPlainFilename(name) {
+			m.message = "Server filename must be a plain filename, not a path."
+			return m, nil
 		}
-		dest := filepath.ToSlash(filepath.Join(m.relDir, name))
-		m.message = fmt.Sprintf("Run locally: ssh -p %d %s 'upload %s' < %s", m.port, m.remote, shellQuoteInsideSingle(dest), shellQuoteArg(m.uploadLocalPath))
+		command := scpUploadCommand(m.port, m.remote, m.uploadLocalPath, name)
+		m.copyCommand = command
+		m.message = "SCP command copied if your terminal allows it. Copy/run this one line:"
 		m.mode = tuiModeBrowse
 		m.input = ""
+		return m, osc52CopyCmd(command)
 	}
+	return m, nil
 }
 
 func (m *tuiModel) loadEntries() {
@@ -305,14 +316,16 @@ func (m *tuiModel) downloadSelected() {
 }
 
 func (m *tuiModel) startUploadHelper() {
-	if !m.app.AllowUpload {
-		m.message = "Upload is disabled. Restart the server with --upload to enable it."
+	if !m.app.UploadEnabled() {
+		m.copyCommand = ""
+		m.message = "Upload is disabled. Restart the server with -upload <directory> to enable scp uploads."
 		return
 	}
 	m.mode = tuiModeUploadPath
 	m.input = ""
 	m.uploadLocalPath = ""
 	m.uploadRemoteName = ""
+	m.copyCommand = ""
 	m.message = "Paste or drag a local file path here, then press Enter."
 }
 
@@ -334,6 +347,36 @@ func (m *tuiModel) goParent() {
 func shellQuoteInsideSingle(s string) string {
 	return strings.ReplaceAll(s, "'", "'\\''")
 }
+
+func scpUploadCommand(port int, remote, localPath, serverName string) string {
+	remoteSpec := fmt.Sprintf("%s:%s", remote, serverName)
+	return fmt.Sprintf("scp -O -P %d %s %s", port, shellQuoteArg(localPath), shellQuoteArg(remoteSpec))
+}
+
+func osc52CopyCmd(text string) tea.Cmd {
+	if text == "" {
+		return nil
+	}
+	seq := "\x1b]52;c;" + base64.StdEncoding.EncodeToString([]byte(text)) + "\x07"
+	return tea.Exec(&terminalWriteCommand{text: seq}, nil)
+}
+
+type terminalWriteCommand struct {
+	text string
+	out  io.Writer
+}
+
+func (c *terminalWriteCommand) Run() error {
+	if c.out == nil {
+		return nil
+	}
+	_, err := io.WriteString(c.out, c.text)
+	return err
+}
+
+func (c *terminalWriteCommand) SetStdin(io.Reader)    {}
+func (c *terminalWriteCommand) SetStdout(w io.Writer) { c.out = w }
+func (c *terminalWriteCommand) SetStderr(io.Writer)   {}
 
 func shellQuoteArg(s string) string {
 	s = strings.TrimSpace(s)
@@ -378,9 +421,14 @@ func (m tuiModel) View() string {
 		body += "\n" + uploadInputStyle.Render(m.uploadPrompt()+"\n"+m.input)
 	}
 	msg := messageStyle.Width(max(40, m.width-4)).Render(m.message)
-	buttons := renderButtons(m.app.AllowUpload)
+	buttons := renderButtons(m.app.UploadEnabled())
 
-	content := lipgloss.JoinVertical(lipgloss.Left, title, pathLine, "", body, "", msg, buttons)
+	parts := []string{title, pathLine, "", body, "", msg}
+	if m.copyCommand != "" {
+		parts = append(parts, m.copyCommand)
+	}
+	parts = append(parts, buttons)
+	content := lipgloss.JoinVertical(lipgloss.Left, parts...)
 	return appStyle.Width(max(50, m.width-2)).Render(content)
 }
 
@@ -437,7 +485,7 @@ func (m tuiModel) uploadPrompt() string {
 	case tuiModeUploadPath:
 		return "Local file path (drag/paste here, Enter):"
 	case tuiModeUploadName:
-		return fmt.Sprintf("Remote filename (Enter = %s):", m.uploadRemoteName)
+		return fmt.Sprintf("Server filename (Enter = %s):", m.uploadRemoteName)
 	default:
 		return ""
 	}

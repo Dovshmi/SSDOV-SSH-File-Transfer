@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -12,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,8 +24,24 @@ import (
 )
 
 type App struct {
-	Root        string
-	AllowUpload bool
+	Root      string
+	UploadDir string
+}
+
+type serverConfig struct {
+	Addr             string
+	Root             string
+	UploadDir        string
+	HostKey          string
+	User             string
+	Password         string
+	AuthKeys         string
+	InsecureAllowAny bool
+	InstallService   bool
+}
+
+func (a App) UploadEnabled() bool {
+	return a.UploadDir != ""
 }
 
 func (a App) ResolvePath(userPath string) (string, error) {
@@ -52,6 +70,31 @@ func (a App) ResolvePath(userPath string) (string, error) {
 	return full, nil
 }
 
+func (a App) ResolveUploadPath(filename string) (string, error) {
+	if !a.UploadEnabled() {
+		return "", errors.New("scp upload disabled; restart server with -upload <directory>")
+	}
+	uploadDir, err := filepath.Abs(expandLeadingTilde(a.UploadDir))
+	if err != nil {
+		return "", err
+	}
+	if !isPlainFilename(filename) {
+		return "", fmt.Errorf("upload destination must be a filename, not a path: %s", filename)
+	}
+	return filepath.Join(uploadDir, filename), nil
+}
+
+func isPlainFilename(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == ".." {
+		return false
+	}
+	if filepath.IsAbs(name) || strings.Contains(name, "/") || strings.Contains(name, `\\`) {
+		return false
+	}
+	return filepath.Clean(name) == name
+}
+
 func (a App) RunCommand(args []string, out io.Writer) int {
 	return a.RunCommandIO(args, strings.NewReader(""), out)
 }
@@ -66,6 +109,8 @@ func (a App) RunCommandIO(args []string, in io.Reader, out io.Writer) int {
 	case "help", "?":
 		fmt.Fprintln(out, helpText())
 		return 0
+	case "scp":
+		return a.runSCPSink(args[1:], in, out)
 	case "ls":
 		p := "."
 		if len(args) > 1 {
@@ -78,12 +123,6 @@ func (a App) RunCommandIO(args []string, in io.Reader, out io.Writer) int {
 			return 2
 		}
 		return a.download(args[1], out)
-	case "upload", "put":
-		if len(args) != 2 {
-			fmt.Fprintln(out, "usage: upload <destination-file>")
-			return 2
-		}
-		return a.upload(args[1], in, out)
 	case "stat":
 		if len(args) != 2 {
 			fmt.Fprintln(out, "usage: stat <path>")
@@ -150,62 +189,182 @@ func (a App) download(userPath string, out io.Writer) int {
 	return 0
 }
 
-func (a App) upload(userPath string, in io.Reader, out io.Writer) int {
-	if !a.AllowUpload {
-		fmt.Fprintln(out, "upload disabled; restart server with --upload to enable uploads")
-		return 1
-	}
-	p, err := a.ResolvePath(userPath)
+func (a App) runSCPSink(args []string, in io.Reader, out io.Writer) int {
+	target, sinkMode, err := parseSCPArgs(args)
 	if err != nil {
-		fmt.Fprintln(out, err)
+		scpFatal(out, err.Error())
 		return 1
 	}
-	if info, err := os.Stat(p); err == nil {
-		if info.IsDir() {
-			fmt.Fprintf(out, "%s is a directory; choose a destination filename\n", userPath)
+	if !sinkMode {
+		scpFatal(out, "only legacy scp upload mode is supported; use scp -O -P <port> <file> user@host:<name>")
+		return 1
+	}
+	if !a.UploadEnabled() {
+		scpFatal(out, "scp upload disabled; restart server with -upload <directory>")
+		return 1
+	}
+
+	br := bufio.NewReader(in)
+	if err := scpAck(out); err != nil {
+		return 1
+	}
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return 0
+			}
+			scpFatal(out, err.Error())
 			return 1
 		}
-		fmt.Fprintf(out, "%s already exists; refusing to overwrite\n", userPath)
-		return 1
-	} else if !errors.Is(err, os.ErrNotExist) {
-		fmt.Fprintln(out, err)
-		return 1
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
+		if line == "" {
+			continue
+		}
+		switch line[0] {
+		case 'T':
+			if err := scpAck(out); err != nil {
+				return 1
+			}
+		case 'D':
+			scpFatal(out, "recursive scp directory upload is not supported")
+			return 1
+		case 'E':
+			_ = scpAck(out)
+			return 0
+		case 'C':
+			if err := a.receiveSCPFile(target, line, br, out); err != nil {
+				scpFatal(out, err.Error())
+				return 1
+			}
+		default:
+			scpFatal(out, "unsupported scp protocol message")
+			return 1
+		}
 	}
+}
 
-	parent := filepath.Dir(p)
-	if info, err := os.Stat(parent); err != nil || !info.IsDir() {
-		fmt.Fprintf(out, "destination folder does not exist: %s\n", filepath.ToSlash(filepath.Dir(userPath)))
-		return 1
+func parseSCPArgs(args []string) (target string, sinkMode bool, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "-t":
+			sinkMode = true
+		case "-d", "-p", "-v", "-r":
+			// -d/-r are rejected later if the client sends directory messages.
+			// -p may send timestamp messages, which we acknowledge and ignore.
+		case "--":
+			if i+1 < len(args) {
+				target = args[i+1]
+			}
+			return target, sinkMode, nil
+		default:
+			if strings.HasPrefix(arg, "-") {
+				return "", false, fmt.Errorf("unsupported scp option: %s", arg)
+			}
+			target = arg
+		}
 	}
+	return target, sinkMode, nil
+}
 
-	tmp, err := os.CreateTemp(parent, ".ssdov-upload-*")
+func (a App) receiveSCPFile(target, header string, in *bufio.Reader, out io.Writer) error {
+	mode, size, protoName, err := parseSCPFileHeader(header)
 	if err != nil {
-		fmt.Fprintln(out, err)
-		return 1
+		return err
+	}
+	filename := target
+	if filename == "" || filename == "." {
+		filename = protoName
+	}
+	dest, err := a.ResolveUploadPath(filename)
+	if err != nil {
+		return err
+	}
+	if info, err := os.Stat(dest); err == nil {
+		if info.IsDir() {
+			return fmt.Errorf("%s is a directory; choose a destination filename", filename)
+		}
+		return fmt.Errorf("%s already exists; refusing to overwrite", filename)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	parent := filepath.Dir(dest)
+	tmp, err := os.CreateTemp(parent, ".ssdov-scp-*")
+	if err != nil {
+		return err
 	}
 	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	ok := false
+	defer func() {
+		if !ok {
+			_ = os.Remove(tmpName)
+		}
+	}()
 
-	n, copyErr := io.Copy(tmp, in)
-	closeErr := tmp.Close()
-	if copyErr != nil {
-		fmt.Fprintln(out, copyErr)
-		return 1
+	if err := scpAck(out); err != nil {
+		_ = tmp.Close()
+		return err
 	}
-	if closeErr != nil {
-		fmt.Fprintln(out, closeErr)
-		return 1
+	if _, err := io.CopyN(tmp, in, size); err != nil {
+		_ = tmp.Close()
+		return err
 	}
-	if err := os.Chmod(tmpName, 0o644); err != nil {
-		fmt.Fprintln(out, err)
-		return 1
+	end, err := in.ReadByte()
+	if err != nil {
+		_ = tmp.Close()
+		return err
 	}
-	if err := os.Rename(tmpName, p); err != nil {
-		fmt.Fprintln(out, err)
-		return 1
+	if end != 0 {
+		_ = tmp.Close()
+		return errors.New("invalid scp file terminator")
 	}
-	fmt.Fprintf(out, "uploaded %s (%d bytes)\n", filepath.ToSlash(userPath), n)
-	return 0
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	perm := os.FileMode(mode) & 0o666
+	if perm == 0 {
+		perm = 0o644
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		return err
+	}
+	ok = true
+	return scpAck(out)
+}
+
+func parseSCPFileHeader(header string) (mode uint64, size int64, filename string, err error) {
+	parts := strings.SplitN(header, " ", 3)
+	if len(parts) != 3 || !strings.HasPrefix(parts[0], "C") {
+		return 0, 0, "", fmt.Errorf("invalid scp file header")
+	}
+	mode, err = strconv.ParseUint(parts[0][1:], 8, 32)
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("invalid scp file mode")
+	}
+	size, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil || size < 0 {
+		return 0, 0, "", fmt.Errorf("invalid scp file size")
+	}
+	filename = parts[2]
+	if !isPlainFilename(filename) {
+		return 0, 0, "", fmt.Errorf("invalid scp file name: %s", filename)
+	}
+	return mode, size, filename, nil
+}
+
+func scpAck(out io.Writer) error {
+	_, err := out.Write([]byte{0})
+	return err
+}
+
+func scpFatal(out io.Writer, msg string) {
+	_, _ = fmt.Fprintf(out, "\x01%s\n", msg)
 }
 
 func (a App) stat(userPath string, out io.Writer) int {
@@ -301,15 +460,17 @@ func helpText() string {
   ls [path]            list files under the download root
   stat <path>          show file/dir info
   download <file>      stream file bytes to stdout
-  upload <file>        stream stdin bytes into a new server file (--upload required)
   cat <file>           same as download
   help                 show this help
   exit                 leave interactive shell
 
+scp upload, if server was started with -upload <directory>:
+  scp -O -P 2222 local-file download@server:server-name
+
 examples from your client machine:
   ssh -p 2222 download@server ls
   ssh -p 2222 download@server 'download docs/readme.md' > readme.md
-  ssh -p 2222 download@server 'upload docs/photo.jpg' < photo.jpg`)
+  scp -O -P 2222 photo.jpg download@server:photo.jpg`)
 }
 
 func appMiddleware(app App) wish.Middleware {
@@ -336,51 +497,171 @@ func appMiddleware(app App) wish.Middleware {
 }
 
 func main() {
-	var (
-		addr    = flag.String("addr", envDefault("SSHDOWN_ADDR", ":2222"), "listen address; use :2222 to avoid normal sshd on port 22")
-		root    = flag.String("root", envDefault("SSHDOWN_ROOT", "."), "download root directory")
-		hostKey = flag.String("host-key", envDefault("SSHDOWN_HOST_KEY", "./sshdown_host_ed25519"), "SSH host key path; created by wish if missing")
-		user    = flag.String("user", envDefault("SSHDOWN_USER", "download"), "allowed SSH username")
-		upload  = flag.Bool("upload", envDefaultBool("SSHDOWN_UPLOAD", false), "enable upload command")
-	)
-	flag.Parse()
-
-	absRoot, err := filepath.Abs(*root)
+	cfg, ok, err := startupConfig(os.Args)
 	if err != nil {
 		log.Fatal(err)
 	}
+	if !ok {
+		return
+	}
+	if err := startServer(cfg); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func startupConfig(args []string) (serverConfig, bool, error) {
+	if shouldRunSetup(args) {
+		return runSetupMenu(defaultSetupConfig("."))
+	}
+	return flagServerConfig(), true, nil
+}
+
+func shouldRunSetup(args []string) bool {
+	return len(args) == 1
+}
+
+func flagServerConfig() serverConfig {
+	var (
+		addr      = flag.String("addr", envDefault("SSHDOWN_ADDR", ":2222"), "listen address; use :2222 to avoid normal sshd on port 22")
+		root      = flag.String("root", envDefault("SSHDOWN_ROOT", "."), "download root directory")
+		hostKey   = flag.String("host-key", envDefault("SSHDOWN_HOST_KEY", "./sshdown_host_ed25519"), "SSH host key path; created by wish if missing")
+		user      = flag.String("user", envDefault("SSHDOWN_USER", "download"), "allowed SSH username")
+		uploadDir = flag.String("upload", envDefault("SSHDOWN_UPLOAD_DIR", ""), "enable legacy scp -O uploads into this existing directory")
+	)
+	flag.Parse()
+
+	rootExplicit := rootFlagExplicitlySet()
+	rootPath := chooseRootPath(*root, *uploadDir, rootExplicit)
+	return serverConfig{
+		Addr:             *addr,
+		Root:             rootPath,
+		UploadDir:        *uploadDir,
+		HostKey:          *hostKey,
+		User:             *user,
+		Password:         os.Getenv("SSHDOWN_PASSWORD"),
+		AuthKeys:         os.Getenv("SSHDOWN_AUTHORIZED_KEYS"),
+		InsecureAllowAny: os.Getenv("SSHDOWN_INSECURE_ALLOW_ANY") == "1",
+	}
+}
+
+func validateServerConfig(cfg serverConfig) (serverConfig, error) {
+	cfg.Addr = normalizeListenAddr(cfg.Addr)
+	if err := validateListenAddr(cfg.Addr); err != nil {
+		return cfg, err
+	}
+	cfg.User = strings.TrimSpace(cfg.User)
+	if cfg.User == "" {
+		return cfg, errors.New("SSH username is required")
+	}
+	if strings.TrimSpace(cfg.HostKey) == "" {
+		cfg.HostKey = "./sshdown_host_ed25519"
+	}
+	if strings.TrimSpace(cfg.Root) == "" {
+		cfg.Root = "."
+	}
+
+	absRoot, err := filepath.Abs(expandLeadingTilde(cfg.Root))
+	if err != nil {
+		return cfg, err
+	}
 	if info, err := os.Stat(absRoot); err != nil || !info.IsDir() {
-		log.Fatalf("download root must be an existing directory: %s", absRoot)
+		return cfg, fmt.Errorf("Download folder must exist: %s", absRoot)
+	}
+	cfg.Root = absRoot
+
+	cfg.UploadDir = normalizeUploadDir(cfg.UploadDir)
+	if cfg.UploadDir != "" {
+		absUploadDir, err := filepath.Abs(expandLeadingTilde(cfg.UploadDir))
+		if err != nil {
+			return cfg, err
+		}
+		if info, err := os.Stat(absUploadDir); err != nil || !info.IsDir() {
+			return cfg, fmt.Errorf("Upload folder must exist: %s", absUploadDir)
+		}
+		cfg.UploadDir = absUploadDir
 	}
 
-	password := os.Getenv("SSHDOWN_PASSWORD")
-	authKeys := os.Getenv("SSHDOWN_AUTHORIZED_KEYS")
-	insecureAllowAny := os.Getenv("SSHDOWN_INSECURE_ALLOW_ANY") == "1"
-	if password == "" && authKeys == "" && !insecureAllowAny {
-		log.Fatal("refusing to start without auth; set SSHDOWN_PASSWORD, SSHDOWN_AUTHORIZED_KEYS, or SSHDOWN_INSECURE_ALLOW_ANY=1 for local testing")
+	if cfg.Password == "" && cfg.AuthKeys == "" && !cfg.InsecureAllowAny {
+		return cfg, errors.New("refusing to start without auth; set a server password, SSHDOWN_AUTHORIZED_KEYS, or SSHDOWN_INSECURE_ALLOW_ANY=1 for local testing")
+	}
+	return cfg, nil
+}
+
+func normalizeListenAddr(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ":2222"
+	}
+	if _, err := strconv.Atoi(value); err == nil {
+		return ":" + value
+	}
+	return value
+}
+
+func normalizeUploadDir(value string) string {
+	value = strings.TrimSpace(value)
+	switch strings.ToLower(value) {
+	case "", "off", "none", "disabled", "no":
+		return ""
+	default:
+		return value
+	}
+}
+
+func validateListenAddr(addr string) error {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q; use a port like 2222 or an address like :2222", addr)
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("invalid port %q; choose a number from 1 to 65535", port)
+	}
+	return nil
+}
+
+func listenPort(addr string) string {
+	_, port, err := net.SplitHostPort(normalizeListenAddr(addr))
+	if err == nil && port != "" {
+		return port
+	}
+	return portFromAddr(addr)
+}
+
+func startServer(cfg serverConfig) error {
+	cfg, err := validateServerConfig(cfg)
+	if err != nil {
+		return err
 	}
 
-	app := App{Root: absRoot, AllowUpload: *upload}
+	app := App{Root: cfg.Root, UploadDir: cfg.UploadDir}
+	if cfg.InstallService {
+		servicePath, err := installStartupService(cfg)
+		if err != nil {
+			return err
+		}
+		log.Printf("Installed startup service: %s", servicePath)
+	}
 	opts := []ssh.Option{
-		wish.WithAddress(*addr),
-		wish.WithHostKeyPath(*hostKey),
+		wish.WithAddress(cfg.Addr),
+		wish.WithHostKeyPath(cfg.HostKey),
 		wish.WithMiddleware(appMiddleware(app), logging.Middleware()),
 	}
-	if password != "" || insecureAllowAny {
+	if cfg.Password != "" || cfg.InsecureAllowAny {
 		opts = append(opts, wish.WithPasswordAuth(func(ctx ssh.Context, pass string) bool {
-			if ctx.User() != *user {
+			if ctx.User() != cfg.User {
 				return false
 			}
-			return insecureAllowAny || pass == password
+			return cfg.InsecureAllowAny || pass == cfg.Password
 		}))
 	}
-	if authKeys != "" {
-		opts = append(opts, wish.WithAuthorizedKeys(authKeys))
+	if cfg.AuthKeys != "" {
+		opts = append(opts, wish.WithAuthorizedKeys(cfg.AuthKeys))
 	}
 
 	s, err := wish.NewServer(opts...)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	done := make(chan os.Signal, 1)
@@ -392,10 +673,16 @@ func main() {
 		_ = s.Shutdown(ctx)
 	}()
 
-	log.Printf("SSDOV listening on %s, root=%s, user=%s", *addr, absRoot, *user)
-	if err := s.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Fatal(err)
+	localIP := detectLocalIP()
+	log.Printf("SSDOV listening on %s, root=%s, upload=%s, user=%s", cfg.Addr, cfg.Root, cfg.UploadDir, cfg.User)
+	log.Printf("Client TUI: ssh -p %s %s@%s", listenPort(cfg.Addr), cfg.User, localIP)
+	if cfg.UploadDir != "" {
+		log.Printf("Client upload: scp -O -P %s local-file %s@%s:filename", listenPort(cfg.Addr), cfg.User, localIP)
 	}
+	if err := s.ListenAndServe(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
+	}
+	return nil
 }
 
 func envDefault(key, fallback string) string {
@@ -405,10 +692,34 @@ func envDefault(key, fallback string) string {
 	return fallback
 }
 
-func envDefaultBool(key string, fallback bool) bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
-	if v == "" {
-		return fallback
+func chooseRootPath(rootPath, uploadDir string, rootExplicit bool) string {
+	if !rootExplicit && os.Getenv("SSHDOWN_ROOT") == "" && strings.TrimSpace(uploadDir) != "" {
+		return uploadDir
 	}
-	return v == "1" || v == "true" || v == "yes" || v == "on"
+	return rootPath
+}
+
+func rootFlagExplicitlySet() bool {
+	explicit := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "root" {
+			explicit = true
+		}
+	})
+	return explicit
+}
+
+func expandLeadingTilde(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+	}
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return p
 }
